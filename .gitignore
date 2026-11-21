@@ -1,8 +1,4 @@
-node_modules/
-.next/
-.env*
-*.tsbuildinfo
-backend/target/
-!backend/.env.example
 /target/
-/mobile/.gradle/
+.env*
+!crates/suki-backend/.env.example
+/crates/suki-mobile/.gradle/
