@@ -5,7 +5,6 @@ use reqwest::Method;
 use suki_shared::{
     Acknowledged,
     auth::{Account, Login, Registration, RegistrationResult, Role},
-    catalog::{Product, ProductAvailability},
 };
 
 #[component]
@@ -22,7 +21,6 @@ pub fn AccountScreen() -> Element {
     let mut shop = use_signal(String::new);
     let mut error = use_signal(String::new);
     if let Some(account) = (state.account)() {
-        let vendor = account.has_role(Role::Vendor);
         return rsx! {
             section { class: "panel", h1 { "Your account" }
                 p { "{account.name} · {account.role}" }
@@ -59,7 +57,6 @@ pub fn AccountScreen() -> Element {
                     });
                 }, "Sign out" }
             }
-            if vendor { VendorStock { vendor_id: account.id } }
         };
     }
     rsx! {
@@ -93,9 +90,9 @@ pub fn AccountScreen() -> Element {
                             api.send::<Acknowledged, _>(Method::POST, "/auth/login", &login).await?;
                             let account: Account = api.get("/auth/me").await?;
                             state.notice.set(format!("Welcome, {}.", account.name));
+                            state.page.set(crate::home_for(&account));
                             state.account.set(Some(account));
                             password.set(String::new());
-                            state.page.set(Page::Market);
                             Ok(())
                         }.await;
                         if let Err(failure) = result { error.set(failure.to_string()); }
@@ -127,51 +124,6 @@ pub fn AccountScreen() -> Element {
                     }
                 }
             }
-        }
-    }
-}
-
-#[component]
-fn VendorStock(vendor_id: String) -> Element {
-    let state = use_context::<State>();
-    let products = state
-        .catalog
-        .read()
-        .iter()
-        .filter(|p| p.vendor_id == vendor_id)
-        .cloned()
-        .collect::<Vec<_>>();
-    rsx! {
-        section { class: "panel", h2 { "Your catalog" }
-            if products.is_empty() { p { "No products have been added to your catalog yet." } }
-            for product in products { StockRow { key: "{product.id}", product } }
-        }
-    }
-}
-
-#[component]
-fn StockRow(product: Product) -> Element {
-    let api = use_context::<Api>();
-    let mut state = use_context::<State>();
-    let mut busy = use_signal(|| false);
-    let available = product.available;
-    rsx! {
-        div { class: "line",
-            span { "{product.name} · {suki_shared::pricing::peso(product.price_centavos)}" }
-            button { disabled: busy(), onclick: move |_| {
-                if busy() { return; }
-                busy.set(true);
-                let api = api.clone();
-                let id = product.id;
-                let update = ProductAvailability { available: !available };
-                spawn(async move {
-                    match api.send::<Acknowledged, _>(Method::PATCH, &format!("/products/{id}/availability"), &update).await {
-                        Ok(_) => crate::refresh_catalog(&api, state).await,
-                        Err(error) => state.notice.set(error.to_string()),
-                    }
-                    busy.set(false);
-                });
-            }, if available { "Mark sold out" } else { "Restock" } }
         }
     }
 }

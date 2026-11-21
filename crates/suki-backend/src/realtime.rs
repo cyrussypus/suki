@@ -14,7 +14,16 @@ use suki_shared::{
     realtime::{CourierLocation, LocationSnapshot, PositionResult},
 };
 async fn chat_access(s: &App, u: &User, oid: &str) -> Result<orders::Order> {
-    let o = orders::access(s, u, oid).await?;
+    let o = if u.role == "vendor" {
+        sqlx::query_as::<_, orders::Order>("SELECT * FROM orders WHERE id=? AND vendor_id=?")
+            .bind(oid)
+            .bind(&u.id)
+            .fetch_optional(&s.db)
+            .await?
+            .ok_or_else(ApiError::forbidden)?
+    } else {
+        orders::access(s, u, oid).await?
+    };
     let cfg = crate::admin::load(&s.db).await?;
     if ["completed", "canceled"].contains(&o.status.as_str())
         && o.updated_at + cfg.chat_retention_days as i64 * 86400 < now()
@@ -30,7 +39,7 @@ pub async fn messages(
     Query(cursor): Query<Cursor>,
 ) -> Result<Json<Vec<ChatMessage>>> {
     chat_access(&s, &u, &oid).await?;
-    Ok(Json(sqlx::query_as("SELECT m.id,m.sender_id,u.name AS sender_name,m.content,m.created_at FROM chat_messages m JOIN users u ON u.id=m.sender_id WHERE order_id=? AND m.id>? ORDER BY m.id LIMIT 200").bind(oid).bind(cursor.after).fetch_all(&s.db).await?))
+    Ok(Json(sqlx::query_as("SELECT m.id,m.order_id,m.sender_id,u.name AS sender_name,COALESCE(m.sender_role,CAST(u.role AS CHAR)) AS sender_role,m.content,m.created_at FROM chat_messages m JOIN users u ON u.id=m.sender_id WHERE order_id=? AND m.id>? ORDER BY m.id LIMIT 200").bind(oid).bind(cursor.after).fetch_all(&s.db).await?))
 }
 pub async fn send_message(
     State(s): State<App>,
@@ -41,7 +50,18 @@ pub async fn send_message(
     chat_access(&s, &u, &oid).await?;
     let content = text(&v.content, 1, 2000)?;
     let mut tx = s.db.begin().await?;
-    orders::locked(&mut tx, &u, &oid).await?;
+    if u.role == "vendor" {
+        let vendor: Option<Option<String>> =
+            sqlx::query_scalar("SELECT vendor_id FROM orders WHERE id=? FOR UPDATE")
+                .bind(&oid)
+                .fetch_optional(&mut *tx)
+                .await?;
+        if vendor.flatten().as_deref() != Some(&u.id) {
+            return Err(ApiError::forbidden());
+        }
+    } else {
+        orders::locked(&mut tx, &u, &oid).await?;
+    }
     let recent: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM chat_messages WHERE sender_id=? AND created_at>?")
             .bind(&u.id)
@@ -56,12 +76,13 @@ pub async fn send_message(
     }
     let created = now();
     let row = sqlx::query(
-        "INSERT INTO chat_messages(order_id,sender_id,content,created_at) VALUES(?,?,?,?)",
+        "INSERT INTO chat_messages(order_id,sender_id,content,created_at,sender_role) VALUES(?,?,?,?,?)",
     )
     .bind(&oid)
     .bind(&u.id)
     .bind(&content)
     .bind(created)
+    .bind(&u.role)
     .execute(&mut *tx)
     .await?;
     tx.commit().await?;
@@ -74,6 +95,8 @@ pub async fn send_message(
                 )
             })?,
             sender_id: u.id.clone(),
+            order_id: oid.clone(),
+            sender_role: u.role.clone(),
             sender_name: u.name.clone(),
             content,
             created_at: created,
@@ -183,6 +206,7 @@ async fn events(socket: WebSocket, s: App, u: User, oid: String, token: SessionT
                     Ok((order, value)) if order == oid => {
                         if !session_valid(&s, &u, &oid, &token).await { break; }
                         if matches!(value, OrderEvent::Location(_)) && orders::access(&s, &u, &oid).await.map(|o|o.status!="out_for_delivery").unwrap_or(true) { continue; }
+                        if u.role == "vendor" && !matches!(value, OrderEvent::Message { .. } | OrderEvent::Resync) { continue; }
                         if output.send(Message::Text(serde_json::to_string(&value).expect("serializable order event").into())).await.is_err() { break; }
                     }
                     Err(broadcast::error::RecvError::Lagged(_)) => {

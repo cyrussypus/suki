@@ -26,6 +26,11 @@ pub fn OrderList() -> Element {
     let mut error = use_signal(String::new);
     let mut loading = use_signal(|| true);
     let signed_in = state.account.read().is_some();
+    let rider = state
+        .account
+        .read()
+        .as_ref()
+        .is_some_and(|u| u.has_role(Role::Rider));
     let list_api = api.clone();
     let refresh = move || {
         let api = list_api.clone();
@@ -51,7 +56,7 @@ pub fn OrderList() -> Element {
     });
     rsx! {
         section { class: "panel",
-            div { class: "line", h1 { "Orders" }
+            div { class: "line", h1 { if rider { "Rider dashboard · Assigned deliveries" } else { "Orders" } }
                 if signed_in { button { disabled: loading(), onclick: move |_| refresh(), "Refresh" } }
             }
             if !signed_in {
@@ -191,8 +196,11 @@ pub fn OrderScreen(id: String) -> Element {
                 }
             }
             Payment { data: data.clone(), path: path.clone(), detail }
+            if let Some(account) = user.clone().filter(|u| u.has_role(Role::Admin) || u.has_role(Role::Rider)) {
+                crate::staff::StaffOrder { data: data.clone(), account, detail }
+            }
             if user.as_ref().is_some_and(|u| u.has_role(Role::Customer))
-                && matches!(data.order.status.as_str(), "awaiting_payment" | "payment_verification" | "paid")
+                && matches!(data.order.status.as_str(), "awaiting_payment" | "payment_verification" | "paid" | "confirmed")
                 && !data.payments.iter().any(|p| p.status == "under_verification")
             {
                 CancelOrder { path: path.clone(), detail }
@@ -226,7 +234,7 @@ pub fn OrderScreen(id: String) -> Element {
                     } else {
                         p { "Waiting for a courier location report." }
                     }
-                    if user.as_ref().is_some_and(|u| data.order.courier_id.as_deref() == Some(&u.id) && (u.has_role(Role::Courier) || u.has_role(Role::Admin))) {
+                    if user.as_ref().is_some_and(|u| data.order.courier_id.as_deref() == Some(&u.id) && (u.has_role(Role::Rider) || u.has_role(Role::Admin))) {
                         CourierReport { path: path.clone() }
                     }
                 }
@@ -288,7 +296,7 @@ async fn snapshot(
     }
 }
 
-async fn catch_up(
+pub(crate) async fn catch_up(
     api: &Api,
     path: &str,
     cursor: &mut i64,
@@ -322,7 +330,7 @@ async fn catch_up(
 }
 
 #[component]
-fn Chat(path: String, messages: Signal<Vec<ChatMessage>>) -> Element {
+pub(crate) fn Chat(path: String, messages: Signal<Vec<ChatMessage>>) -> Element {
     let api = use_context::<Api>();
     let mut text = use_signal(String::new);
     let mut busy = use_signal(|| false);
@@ -334,7 +342,7 @@ fn Chat(path: String, messages: Signal<Vec<ChatMessage>>) -> Element {
                 if messages.read().is_empty() { p { "No messages yet." } }
                 for message in messages.read().iter() {
                     article { key: "{message.id}",
-                        strong { "{message.sender_name}" } small { "{date(message.created_at)}" }
+                        strong { "{message.sender_name} · " if message.sender_role == "courier" { "rider" } else { "{message.sender_role}" } } small { "{date(message.created_at)}" }
                         p { "{message.content}" }
                     }
                 }
@@ -377,7 +385,8 @@ fn Payment(data: OrderDetail, path: String, mut detail: Signal<Option<OrderDetai
         .filter_map(|p| p.received_amount_centavos)
         .sum();
     let due = data.order.authorized_goods_centavos + data.order.delivery_fee_centavos - paid;
-    let can_pay = due > 0
+    let can_pay = !data.order.is_cod()
+        && due > 0
         && state
             .account
             .read()
@@ -398,7 +407,7 @@ fn Payment(data: OrderDetail, path: String, mut detail: Signal<Option<OrderDetai
         .and_then(|settings| api.image(&settings.gcash_qr_url));
     rsx! {
         section { class: "panel",
-            h2 { "GCash payment" }
+            h2 { if data.order.is_cod() { "Cash on delivery" } else { "GCash payment" } }
             p { "Payment status: {label(&data.order.payment_status)}" }
             for payment in data.payments.iter() {
                 div { class: "line", key: "{payment.id}", span { "{payment.reference} · {label(&payment.status)}" } strong { "{peso(payment.claimed_amount_centavos)}" } }
@@ -406,11 +415,16 @@ fn Payment(data: OrderDetail, path: String, mut detail: Signal<Option<OrderDetai
             for (id, amount, status) in data.refunds.iter() {
                 div { class: "line", key: "{id}", span { "Refund · {label(status)}" } strong { "{peso(*amount)}" } }
             }
+            if data.order.is_cod() && data.order.payment_status == "cod_pending" {
+                p { "Pay the assigned rider {peso(data.order.final_goods_centavos.unwrap_or(data.order.goods_subtotal_centavos) + data.order.delivery_fee_centavos)} at handoff." }
+            }
             if can_pay {
-                if let Some(qr) = qr {
+                if let Some(number) = &data.order.gcash_number {
+                    p { "Transfer to this vendor's GCash number: " strong { "{number}" } }
+                } else if let Some(qr) = qr {
                     img { class: "qr", src: "{qr}", alt: "Operator GCash payment QR" }
                 }
-                p { "Outstanding: {peso(due)}. An administrator verifies the payment after you submit the reference." }
+                p { "Outstanding: {peso(due)}. Submit the reference after paying. The rider or an administrator will review it." }
                 form {
                     onsubmit: move |event| {
                         event.prevent_default();
@@ -532,10 +546,56 @@ fn CourierReport(path: String) -> Element {
     let mut lng = use_signal(String::new);
     let mut status = use_signal(String::new);
     let mut busy = use_signal(|| false);
+    let mut sharing = use_signal(|| false);
+    let location_api = api.clone();
+    let location_path = format!("{path}/location");
+    use_resource(move || {
+        let active = sharing();
+        let (api, endpoint) = (location_api.clone(), location_path.clone());
+        async move {
+            if !active {
+                return;
+            }
+            let source = match crate::gps::Source::new() {
+                Ok(source) => source,
+                Err(error) => {
+                    status.set(error);
+                    sharing.set(false);
+                    return;
+                }
+            };
+            loop {
+                match source.position().await {
+                    Ok(position) => {
+                        match api
+                            .send::<PositionResult, _>(Method::PUT, &endpoint, &position)
+                            .await
+                        {
+                            Ok(_) => status.set("Live rider location shared.".into()),
+                            Err(error) => {
+                                status.set(error.to_string());
+                                if matches!(error.status, Some(401 | 403 | 409)) {
+                                    sharing.set(false);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    Err(error) => status.set(error),
+                }
+                delay(5_000).await;
+            }
+        }
+    });
     rsx! {
+        button { r#type: "button", onclick: move |_| {
+            let enabled = !sharing();
+            sharing.set(enabled);
+            status.set(if enabled { "Requesting device location…" } else { "Live location paused." }.into());
+        }, if sharing() { "Stop live GPS" } else { "Share live GPS" } }
         form { onsubmit: move |event| {
             event.prevent_default();
-            if busy() { return; }
+            if busy() || sharing() { return; }
             let (Ok(lat), Ok(lng)) = (lat().parse::<f64>(), lng().parse::<f64>()) else {
                 status.set("Enter valid coordinates.".into());
                 return;
@@ -557,7 +617,7 @@ fn CourierReport(path: String) -> Element {
                 label { "Courier latitude" input { required: true, inputmode: "decimal", value: "{lat}", oninput: move |e| lat.set(e.value()) } }
                 label { "Courier longitude" input { required: true, inputmode: "decimal", value: "{lng}", oninput: move |e| lng.set(e.value()) } }
             }
-            button { disabled: busy(), "Report location" }
+            button { disabled: busy() || sharing(), "Report coordinates manually" }
             p { role: "status", "{status}" }
         }
     }

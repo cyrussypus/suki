@@ -32,6 +32,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         maps_key: std::env::var("GOOGLE_MAPS_API_KEY").unwrap_or_default(),
         maps_url: std::env::var("GOOGLE_ROUTES_URL")
             .unwrap_or_else(|_| "https://routes.googleapis.com/directions/v2:computeRoutes".into()),
+        legacy_quotes: std::env::var("SUKI_ALLOW_LEGACY_QUOTES").as_deref() == Ok("true"),
+        media_dir: std::env::var_os("SUKI_MEDIA_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| "target/suki-media".into()),
         events: tokio::sync::broadcast::channel(256).0,
     });
     let listener = tokio::net::TcpListener::bind(

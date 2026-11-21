@@ -14,3 +14,6 @@ compile_sdk = 35
 
 [android.application]
 uses_cleartext_traffic = false
+
+[permissions]
+location = { precision = "fine", description = "Share your location with the customer during an active delivery." }

@@ -1,6 +1,7 @@
 use crate::*;
 use crate::{auth::User, orders};
 use axum::extract::{Path, State};
+use suki_shared::payments::CashCollection;
 pub use suki_shared::payments::{Evidence, EvidenceResult, Payment, RefundReference, Verification};
 pub async fn received(tx: &mut sqlx::Transaction<'_, sqlx::MySql>, oid: &str) -> Result<i64> {
     Ok(sqlx::query_scalar("SELECT CAST(COALESCE(SUM(received_amount_centavos),0) AS SIGNED) FROM payments WHERE order_id=? AND status='paid'").bind(oid).fetch_one(&mut **tx).await?)
@@ -23,6 +24,9 @@ pub async fn submit(
     }
     let mut tx = s.db.begin().await?;
     let o = orders::locked(&mut tx, &u, &oid).await?;
+    if o.is_cod() {
+        return Err(ApiError::conflict("This order uses cash on delivery"));
+    }
     if ![
         "awaiting_payment",
         "payment_verification",
@@ -68,6 +72,9 @@ pub async fn submit(
     )
     .await?;
     tx.commit().await?;
+    if o.vendor_id.is_some() {
+        let _ = s.events.send((oid, OrderEvent::Resync));
+    }
     Ok(Json(EvidenceResult {
         id: pid,
         status: "under_verification".into(),
@@ -79,7 +86,7 @@ pub async fn verify(
     Path(pid): Path<String>,
     Json(v): Json<Verification>,
 ) -> Result<Json<StatusResult>> {
-    u.require(&["admin"])?;
+    u.require(&["admin", "courier"])?;
     let mut tx = s.db.begin().await?;
     let oid: String = sqlx::query_scalar("SELECT order_id FROM payments WHERE id=?")
         .bind(&pid)
@@ -87,6 +94,9 @@ pub async fn verify(
         .await?
         .ok_or(ApiError::bad("Payment not found"))?;
     let o = orders::locked(&mut tx, &u, &oid).await?;
+    if o.is_cod() || u.role == "courier" && o.vendor_id.is_none() {
+        return Err(ApiError::forbidden());
+    }
     let p: Payment = sqlx::query_as("SELECT * FROM payments WHERE id=? FOR UPDATE")
         .bind(&pid)
         .fetch_one(&mut *tx)
@@ -153,6 +163,9 @@ pub async fn verify(
     )
     .await?;
     tx.commit().await?;
+    if o.vendor_id.is_some() {
+        let _ = s.events.send((oid, OrderEvent::Resync));
+    }
     Ok(Json(StatusResult {
         status: status.into(),
     }))
@@ -212,5 +225,93 @@ pub async fn refund(
     )
     .await?;
     tx.commit().await?;
+    Ok(Json(Acknowledged { ok: true }))
+}
+
+pub async fn pending(State(s): State<App>, u: User) -> Result<Json<Vec<Payment>>> {
+    u.require(&["admin"])?;
+    Ok(Json(sqlx::query_as("SELECT * FROM payments WHERE status='under_verification' ORDER BY created_at LIMIT 200")
+        .fetch_all(&s.db).await?))
+}
+
+pub async fn collect_cash(
+    State(s): State<App>,
+    u: User,
+    Path(oid): Path<String>,
+    Json(input): Json<CashCollection>,
+) -> Result<Json<Acknowledged>> {
+    u.require(&["courier", "admin"])?;
+    let mut tx = s.db.begin().await?;
+    let o = orders::locked(&mut tx, &u, &oid).await?;
+    if o.courier_id.as_deref() != Some(&u.id) {
+        return Err(ApiError::forbidden());
+    }
+    if !o.is_cod() || o.payment_status != "cod_pending" || o.status != "out_for_delivery" {
+        return Err(ApiError::conflict("Cash is not collectible for this order"));
+    }
+    let due = o
+        .final_goods_centavos
+        .ok_or(ApiError::conflict("Reconcile goods before collection"))?
+        + o.delivery_fee_centavos;
+    if input.amount_centavos != due {
+        return Err(ApiError::bad("Cash must match the reconciled total"));
+    }
+    let timestamp = now();
+    sqlx::query("INSERT INTO payments(id,order_id,reference,claimed_amount_centavos,received_amount_centavos,status,verified_by,created_at,verified_at) VALUES(?,?,?,?,?,'paid',?,?,?)")
+        .bind(id()).bind(&oid).bind(format!("cod:{oid}")).bind(due).bind(due).bind(&u.id).bind(timestamp).bind(timestamp)
+        .execute(&mut *tx).await?;
+    sqlx::query("UPDATE orders SET payment_status='paid' WHERE id=?")
+        .bind(&oid)
+        .execute(&mut *tx)
+        .await?;
+    audit(
+        &mut tx,
+        &u.id,
+        "payment.cash_collected",
+        &oid,
+        json!({"amount_centavos": due}),
+    )
+    .await?;
+    tx.commit().await?;
+    let _ = s.events.send((oid, OrderEvent::Resync));
+    Ok(Json(Acknowledged { ok: true }))
+}
+
+pub async fn settle_vendor(
+    State(s): State<App>,
+    u: User,
+    Path(oid): Path<String>,
+    Json(input): Json<RefundReference>,
+) -> Result<Json<Acknowledged>> {
+    u.require(&["courier", "admin"])?;
+    let reference = text(&input.reference, 6, 100)?;
+    let mut tx = s.db.begin().await?;
+    let o = orders::locked(&mut tx, &u, &oid).await?;
+    if o.courier_id.as_deref() != Some(&u.id) {
+        return Err(ApiError::forbidden());
+    }
+    if o.vendor_id.is_none()
+        || o.status != "delivered"
+        || !matches!(o.payment_status.as_str(), "paid" | "partially_refunded")
+    {
+        return Err(ApiError::conflict(
+            "Only delivered and paid marketplace orders can be settled",
+        ));
+    }
+    let amount = o
+        .final_goods_centavos
+        .ok_or(ApiError::conflict("Reconcile goods before settling"))?;
+    sqlx::query("INSERT INTO vendor_settlements(order_id,amount_centavos,reference,recorded_by,recorded_at) VALUES(?,?,?,?,?)")
+        .bind(&oid).bind(amount).bind(&reference).bind(&u.id).bind(now()).execute(&mut *tx).await?;
+    audit(
+        &mut tx,
+        &u.id,
+        "payment.vendor_settlement",
+        &oid,
+        json!({"amount_centavos":amount}),
+    )
+    .await?;
+    tx.commit().await?;
+    let _ = s.events.send((oid, OrderEvent::Resync));
     Ok(Json(Acknowledged { ok: true }))
 }

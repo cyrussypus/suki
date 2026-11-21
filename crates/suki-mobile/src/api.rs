@@ -141,6 +141,43 @@ impl Api {
         if let Some(body) = body {
             request = request.json(body);
         }
+        Self::execute(request).await
+    }
+
+    pub async fn upload<T: DeserializeOwned + Send + 'static>(
+        &self,
+        method: Method,
+        path: &str,
+        product: &suki_shared::catalog::CreateProductDto,
+        photo: Option<Vec<u8>>,
+    ) -> Result<T, Failure> {
+        let url = self
+            .origin
+            .join(&format!("/api{path}"))
+            .expect("internal API path");
+        let mut form = reqwest::multipart::Form::new().text(
+            "product",
+            serde_json::to_string(product).expect("serializable product"),
+        );
+        if let Some(photo) = photo {
+            form = form.part(
+                "photo",
+                reqwest::multipart::Part::bytes(photo).file_name("product-photo"),
+            );
+        }
+        Self::execute(
+            self.client
+                .request(method, url)
+                .header("X-Suki-Request", "1")
+                .timeout(std::time::Duration::from_secs(30))
+                .multipart(form),
+        )
+        .await
+    }
+
+    async fn execute<T: DeserializeOwned + Send + 'static>(
+        request: reqwest::RequestBuilder,
+    ) -> Result<T, Failure> {
         let call = async move {
             let response = request.send().await.map_err(|_| unavailable())?;
             let status = response.status();
@@ -168,7 +205,7 @@ impl Api {
     pub fn events(&self, order_id: &str) -> EventStream {
         let mut url = self
             .origin
-            .join(&format!("/api/orders/{order_id}/events"))
+            .join(&format!("/api/orders/{order_id}/chat/ws"))
             .expect("internal event path");
         url.set_scheme(if url.scheme() == "https" { "wss" } else { "ws" })
             .expect("WebSocket scheme");

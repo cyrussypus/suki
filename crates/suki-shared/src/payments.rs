@@ -39,3 +39,31 @@ pub struct EvidenceResult {
     pub id: String,
     pub status: String,
 }
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PaymentMethod {
+    #[default]
+    Gcash,
+    CashOnDelivery,
+}
+impl PaymentMethod {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Gcash => "gcash",
+            Self::CashOnDelivery => "cash_on_delivery",
+        }
+    }
+}
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CashCollection {
+    pub amount_centavos: i64,
+}
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[cfg_attr(feature = "sqlx", derive(sqlx::FromRow))]
+pub struct VendorSettlement {
+    pub amount_centavos: i64,
+    pub reference: String,
+    pub recorded_at: i64,
+}

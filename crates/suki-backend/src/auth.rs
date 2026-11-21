@@ -127,7 +127,7 @@ pub async fn register(
     let mut tx = s.db.begin().await?;
     sqlx::query("INSERT INTO users(id,name,email,phone,password_hash,role,status,created_at) VALUES(?,?,?,?,?,?,?,?)").bind(&user_id).bind(name).bind(email).bind(phone).bind(password).bind(&input.role).bind(status).bind(now()).execute(&mut *tx).await?;
     if let Some(shop) = shop {
-        sqlx::query("INSERT INTO vendor_profiles VALUES (?,?)")
+        sqlx::query("INSERT INTO vendor_profiles(user_id,shop_name) VALUES (?,?)")
             .bind(&user_id)
             .bind(shop)
             .execute(&mut *tx)

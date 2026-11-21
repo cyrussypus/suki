@@ -82,9 +82,30 @@ Principal flow: `awaiting_payment → payment_verification → paid → shopping
 
 Configure a restricted server `GOOGLE_MAPS_API_KEY` with Google Routes `directions/v2:computeRoutes`. The API sends driving origin/destination coordinates and requests `routes.distanceMeters`. It validates coordinate ranges, configured bounding-box coverage and maximum road distance. The default origin is Bankerohan. Administrators must review the origin and coverage against actual operations before launch.
 
-Fee: `base_fee_centavos + round(per_km_centavos × distance_meters / 1000)`. Defaults are ₱60 + ₱3.50/km and ₱450 goods. The app uses saved or manually entered destination coordinates. A device GPS picker and interactive map are future work.
+<!-- coderabbit-ai-generated:v1 -->
 
-Upload the operator's actual GCash QR as a local `/images/...` asset and set `gcash_qr_url` through the admin settings API. Do not substitute a sample QR. Checkout fails closed if routing or the configured QR is missing. Evidence is a reference number; screenshot upload is not implemented. No GCash PIN/password is collected. Real Google routing and real GCash transactions were not exercised in this sandbox. Emulate v0.0.1 was inspected: its Google service does not implement Maps/Routes. The integration test uses its own explicit synthetic Routes HTTP fixture and never configures that fixture as the preview's provider.
+<!-- coderabbit-ai-generated-section:v1:239fcda9ec8b83951d7be0fd073eb0f44d57ea9463faecbf4aa0e63f6ae61773 -->
+
+Marketplace endpoints (prefix `/api`):
+
+| Method | Path | Purpose |
+| --- | --- | --- |
+| POST, PUT | `/vendor/goods`, `/vendor/goods/{id}` | Create or edit an owned product. Send multipart `product` JSON plus a JPEG or PNG `photo` (optional when editing). |
+| PATCH | `/vendor/goods/{id}/price`, `/vendor/goods/{id}/availability` | Update only `price_centavos` or `available`, respectively. |
+| GET, PUT | `/vendor/payment-profile` | Read or change the signed-in vendor's `gcash_number`. |
+| POST | `/quotes/delivery` | Quote using `address`, `lat`, `lng`, and `weight_grams`. |
+| GET | `/orders/{id}/chat/ws` | Customer, order vendor, and assigned rider receive committed chat events. Use the existing messages path to post and catch up. |
+| POST | `/orders/{id}/cash-collection` | Assigned rider attests to the exact reconciled amount collected at handoff. |
+| POST | `/orders/{id}/vendor-settlement` | Assigned rider records the receipt or confirms the vendor received the direct transfer. |
+| GET | `/admin/payments/pending` | List references awaiting manual verification. |
+
+The new quote uses `max(8500, round((700 × meters + 500 × grams) / 1000))`. Customer checkout supplies `payment_method` (`gcash` or `cash_on_delivery`). Prices and weight are verified again before the order is placed. The legacy quote endpoint is disabled by default; `SUKI_ALLOW_LEGACY_QUOTES=true` temporarily enables it for older deployments. Existing orders use their snapshotted amounts and payment rules.
+
+The backend re-encodes vendor photos before serving them and stores them under `SUKI_MEDIA_DIR`. Back up that directory with MariaDB. Replaced files are retained so historical URLs remain readable; an operator can reclaim unreferenced files offline. Native and browser clients upload through the same API.
+
+Real Google routing and GCash transactions need provider testing. The database integration test uses its own synthetic Routes server.
+
+<!-- /coderabbit-ai-generated:v1 -->
 
 ## Validation
 
@@ -108,4 +129,10 @@ cargo test --locked -- --include-ignored
 6. Regularly create a separate empty database ending in `_restore`, set `RESTORE_DATABASE`, and run `crates/suki-backend/scripts/restore-test.sh /private/backups/suki.sql.gz`. The script refuses a nonempty target. Compare table counts and important order/payment totals to the source. This restore path was exercised locally against synthetic records; remote scheduling, encryption and recovery objectives remain deployment responsibilities.
 7. Schedule `crates/suki-backend/scripts/prune.sql` daily: expires sessions, old attempt counters/quotes, and chat beyond the configured completed/canceled-order retention (default 30 days). Live locations are deleted at completion/cancellation. Agree on legal retention periods and account erasure procedures for financial/order/audit records before production; do not delete financial evidence ad hoc.
 
-The operator must finalize substitution, cancellation, payment dispute and refund policies, perform real-provider acceptance testing, and complete production monitoring/backups/privacy configuration before a controlled pilot. Full administrator/courier dashboards, Google map rendering and courier foreground GPS controls are not yet present in the storefront; their backend endpoints are implemented and tested.
+<!-- coderabbit-ai-generated:v1 -->
+
+<!-- coderabbit-ai-generated-section:v1:a716b04dbf9c863a537267d5455551c60a01f525aba4fba5eda398c35d205d92 -->
+
+Before a controlled pilot, finalize substitution, cancellation, payment dispute, and refund procedures. Verify real Google Routes and GCash transactions, test location sharing on devices, and configure monitoring, backups, and privacy controls.
+
+<!-- /coderabbit-ai-generated:v1 -->

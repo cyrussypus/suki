@@ -70,3 +70,8 @@ textarea{min-height:5rem;resize:vertical}
 .chat article p{white-space:pre-wrap;overflow-wrap:anywhere;margin:.2rem 0 0}
 .qr{display:block;width:min(15rem,100%);margin:1rem 0}
 @media(max-width:410px){main{padding-inline:.75rem}nav{gap:.15rem;padding-inline:.4rem}nav button{font-size:.85rem;padding-inline:.35rem}.line{flex-wrap:wrap}}
+
+.editor { position: fixed; z-index: 5; inset: 4vh 1rem auto; width: min(36rem, calc(100% - 2rem)); max-height: 85vh; overflow: auto; margin: auto; color: inherit; box-shadow: 0 12px 64px #17282344; }
+.editor input, .editor select { min-width: 0; }
+summary { cursor: pointer; font-weight: 700; }
+.panel article + article { margin-top: 1rem; }

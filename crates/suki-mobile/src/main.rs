@@ -1,8 +1,11 @@
 mod account;
 mod api;
 mod checkout;
+mod gps;
 mod market;
 mod orders;
+mod staff;
+mod vendor;
 
 use api::Api;
 use dioxus::prelude::*;
@@ -19,6 +22,7 @@ enum Page {
     Basket,
     Orders,
     Account,
+    Dashboard,
 }
 
 #[derive(Clone, Copy)]
@@ -34,6 +38,14 @@ struct State {
     favorites: Signal<Favorites>,
     active_order: Signal<Option<String>>,
     notice: Signal<String>,
+}
+
+fn home_for(account: &Account) -> Page {
+    if account.has_role(Role::Customer) {
+        Page::Market
+    } else {
+        Page::Dashboard
+    }
 }
 
 fn main() {
@@ -67,6 +79,9 @@ fn App() -> Element {
         async move {
             refresh_catalog(&api, state).await;
             if let Ok(account) = api.get::<Account>("/auth/me").await {
+                if (state.page)() == Page::Market {
+                    state.page.set(home_for(&account));
+                }
                 state.account.set(Some(account));
             }
         }
@@ -75,11 +90,9 @@ fn App() -> Element {
     let active = (state.active_order)();
     let basket_count = state.basket.read().len();
     let signed_in = state.account.read().is_some();
-    let vendor = state
-        .account
-        .read()
-        .as_ref()
-        .is_some_and(|a| a.has_role(Role::Vendor));
+    let account = (state.account)();
+    let customer = account.as_ref().is_none_or(|a| a.has_role(Role::Customer));
+    let vendor = account.as_ref().is_some_and(|a| a.has_role(Role::Vendor));
     rsx! {
         style { {include_str!("style.css")} }
         header {
@@ -105,12 +118,22 @@ fn App() -> Element {
                     rsx! { orders::OrderList {} }
                 },
                 Page::Account => rsx! { account::AccountScreen {} },
+                Page::Dashboard => match &account {
+                    Some(a) if a.has_role(Role::Vendor) => rsx! { vendor::VendorDashboard { vendor_id: a.id.clone() } },
+                    Some(a) if a.has_role(Role::Admin) => rsx! { staff::AdminDashboard {} },
+                    Some(a) if a.has_role(Role::Rider) => rsx! { orders::OrderList {} },
+                    _ => rsx! { market::Market { favorites_only: false } },
+                },
             }
         }
         nav { aria_label: "Main navigation",
-            button { aria_current: if page == Page::Market { "page" }, onclick: move |_| state.page.set(Page::Market), "Market" }
-            button { aria_current: if page == Page::Favorites { "page" }, onclick: move |_| state.page.set(Page::Favorites), "Favorites" }
-            button { aria_current: if page == Page::Basket { "page" }, onclick: move |_| state.page.set(Page::Basket), "Basket ({basket_count})" }
+            if customer {
+                button { aria_current: if page == Page::Market { "page" }, onclick: move |_| state.page.set(Page::Market), "Market" }
+                button { aria_current: if page == Page::Favorites { "page" }, onclick: move |_| state.page.set(Page::Favorites), "Favorites" }
+                button { aria_current: if page == Page::Basket { "page" }, onclick: move |_| state.page.set(Page::Basket), "Basket ({basket_count})" }
+            } else {
+                button { aria_current: if page == Page::Dashboard { "page" }, onclick: move |_| state.page.set(Page::Dashboard), "Dashboard" }
+            }
             if !vendor {
                 button { aria_current: if page == Page::Orders { "page" }, onclick: move |_| {
                     state.active_order.set(None); state.page.set(Page::Orders);

@@ -5,7 +5,11 @@ pub use suki_shared::orders::{
     AdjustmentProposal, Assignment, Checkout, CheckoutItem, Decision, Item, Order, Purchase,
     Status, Substitution,
 };
-use suki_shared::orders::{CheckoutResult, OrderDetail, PurchaseResult, Reconciliation};
+use suki_shared::{
+    delivery::{grams_rounded_up, line_weight_milligrams},
+    orders::{CheckoutResult, OrderDetail, PurchaseResult, Reconciliation},
+    payments::{PaymentMethod, VendorSettlement},
+};
 pub async fn access(s: &App, u: &User, oid: &str) -> Result<Order> {
     let o: Order = sqlx::query_as("SELECT * FROM orders WHERE id=?")
         .bind(oid)
@@ -99,6 +103,12 @@ pub async fn detail(
     .bind(&oid)
     .fetch_all(&s.db)
     .await?;
+    let settlement: Option<VendorSettlement> = sqlx::query_as(
+        "SELECT amount_centavos,reference,recorded_at FROM vendor_settlements WHERE order_id=?",
+    )
+    .bind(&oid)
+    .fetch_optional(&s.db)
+    .await?;
     Ok(Json(OrderDetail {
         order: o,
         items,
@@ -107,6 +117,7 @@ pub async fn detail(
         adjustments,
         substitutions,
         history,
+        settlement,
     }))
 }
 #[derive(sqlx::FromRow)]
@@ -120,6 +131,7 @@ struct Quote {
     fee_centavos: i64,
     expires_at: i64,
     consumed: bool,
+    weight_grams: Option<i64>,
 }
 pub async fn create(
     State(s): State<App>,
@@ -178,7 +190,13 @@ pub async fn create(
     if q.distance_meters > settings.max_distance_meters {
         return Err(ApiError::bad("Delivery exceeds current service coverage"));
     }
-    if settings.gcash_qr_url.is_empty() {
+    let cod = v.payment_method == PaymentMethod::CashOnDelivery;
+    if cod && q.weight_grams.is_none() {
+        return Err(ApiError::bad(
+            "Request a weight-based quote for cash on delivery",
+        ));
+    }
+    if q.weight_grams.is_none() && settings.gcash_qr_url.is_empty() {
         return Err(ApiError(
             StatusCode::SERVICE_UNAVAILABLE,
             "The operator has not configured GCash payments".into(),
@@ -210,8 +228,52 @@ pub async fn create(
             "Goods subtotal must meet the minimum and supported spending limit",
         ));
     }
+    let mut vendor_id = None;
+    let mut gcash_number = None;
+    if let Some(quoted_grams) = q.weight_grams {
+        let vendor = &snapshots[0].0.vendor_id;
+        if snapshots.iter().any(|(p, _, _)| &p.vendor_id != vendor) {
+            return Err(ApiError::bad(
+                "Each order must contain goods from one vendor stall",
+            ));
+        }
+        let mut milligrams = 0;
+        for (p, qty, _) in &snapshots {
+            milligrams += line_weight_milligrams(p.weight_grams, *qty)
+                .ok_or(ApiError::bad("Invalid item weight"))?;
+        }
+        if grams_rounded_up(milligrams) != quoted_grams {
+            return Err(ApiError::conflict(
+                "Basket weight changed; request a new delivery quote",
+            ));
+        }
+        vendor_id = Some(vendor.clone());
+        if !cod {
+            gcash_number = sqlx::query_scalar::<_, Option<String>>(
+                "SELECT gcash_number FROM vendor_profiles WHERE user_id=?",
+            )
+            .bind(vendor)
+            .fetch_one(&mut *tx)
+            .await?;
+            if gcash_number.is_none() {
+                return Err(ApiError::conflict(
+                    "This vendor has not configured GCash; choose cash on delivery",
+                ));
+            }
+        }
+    }
+    let status = if cod { "confirmed" } else { "awaiting_payment" };
+    let payment_status = if cod {
+        "cod_pending"
+    } else {
+        "awaiting_payment"
+    };
     let oid = id();
-    sqlx::query("INSERT INTO orders(id,customer_id,status,address,lat,lng,distance_meters,delivery_fee_centavos,goods_subtotal_centavos,estimated_total_centavos,authorized_goods_centavos,idempotency_key,request_hash,created_at,updated_at) VALUES (?,?,'awaiting_payment',?,?,?,?,?,?,?,?,?,?,?,?)").bind(&oid).bind(&u.id).bind(&q.address).bind(q.lat).bind(q.lng).bind(q.distance_meters).bind(q.fee_centavos).bind(subtotal).bind(subtotal+q.fee_centavos).bind(subtotal).bind(&v.idempotency_key).bind(digest).bind(now()).bind(now()).execute(&mut *tx).await?;
+    sqlx::query("INSERT INTO orders(id,customer_id,status,payment_status,payment_method,vendor_id,gcash_number,weight_grams,address,lat,lng,distance_meters,delivery_fee_centavos,goods_subtotal_centavos,estimated_total_centavos,authorized_goods_centavos,idempotency_key,request_hash,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
+        .bind(&oid).bind(&u.id).bind(status).bind(payment_status).bind(v.payment_method.as_str())
+        .bind(vendor_id).bind(gcash_number).bind(q.weight_grams).bind(&q.address).bind(q.lat).bind(q.lng)
+        .bind(q.distance_meters).bind(q.fee_centavos).bind(subtotal).bind(subtotal+q.fee_centavos)
+        .bind(subtotal).bind(&v.idempotency_key).bind(digest).bind(now()).bind(now()).execute(&mut *tx).await?;
     for (p, qty, value) in snapshots {
         sqlx::query("INSERT INTO order_items(id,order_id,product_id,vendor_id,name,unit,unit_price_centavos,quantity_milli,estimated_cost_centavos) VALUES (?,?,?,?,?,?,?,?,?)").bind(id()).bind(&oid).bind(p.id).bind(p.vendor_id).bind(p.name).bind(p.unit).bind(p.price_centavos).bind(qty).bind(value).execute(&mut *tx).await?;
     }
@@ -219,7 +281,7 @@ pub async fn create(
         .bind(q.id)
         .execute(&mut *tx)
         .await?;
-    history(&mut tx, &u, &oid, "awaiting_payment").await?;
+    history(&mut tx, &u, &oid, status).await?;
     tx.commit().await?;
     Ok(Json(CheckoutResult {
         id: oid,
@@ -235,11 +297,21 @@ pub async fn assign(
     u.require(&["admin"])?;
     let mut tx = s.db.begin().await?;
     let o = locked(&mut tx, &u, &oid).await?;
-    if !["paid", "shopping", "ready_for_delivery", "price_adjustment"].contains(&o.status.as_str())
+    if ![
+        "paid",
+        "confirmed",
+        "shopping",
+        "ready_for_delivery",
+        "price_adjustment",
+    ]
+    .contains(&o.status.as_str())
+        && !(o.vendor_id.is_some()
+            && matches!(
+                o.status.as_str(),
+                "awaiting_payment" | "payment_verification"
+            ))
     {
-        return Err(ApiError::conflict(
-            "Only paid active orders can be assigned",
-        ));
+        return Err(ApiError::conflict("This order cannot be assigned"));
     }
     let valid: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM users WHERE id=? AND role IN ('courier','admin') AND status='active'",
@@ -269,7 +341,7 @@ pub async fn assign(
 pub fn allowed_transition(from: &str, to: &str) -> bool {
     matches!(
         (from, to),
-        ("paid", "shopping")
+        ("paid" | "confirmed", "shopping")
             | ("ready_for_delivery", "out_for_delivery")
             | ("out_for_delivery", "delivered")
             | ("delivered", "completed")
@@ -287,8 +359,13 @@ pub async fn transition(
         if ["completed", "delivered", "canceled"].contains(&o.status.as_str())
             || !(u.role == "admin"
                 || u.role == "customer"
-                    && ["awaiting_payment", "payment_verification", "paid"]
-                        .contains(&o.status.as_str()))
+                    && [
+                        "awaiting_payment",
+                        "payment_verification",
+                        "paid",
+                        "confirmed",
+                    ]
+                    .contains(&o.status.as_str()))
         {
             return Err(ApiError::forbidden());
         }
@@ -312,10 +389,26 @@ pub async fn transition(
         if !allowed_transition(&o.status, &v.status) {
             return Err(ApiError::conflict("Invalid order status transition"));
         }
-        if !["paid", "partially_refunded"].contains(&o.payment_status.as_str()) {
+        let cod_in_progress = o.is_cod()
+            && o.payment_status == "cod_pending"
+            && matches!(v.status.as_str(), "shopping" | "out_for_delivery");
+        if !cod_in_progress && !["paid", "partially_refunded"].contains(&o.payment_status.as_str())
+        {
             return Err(ApiError::conflict(
                 "Payment must be verified before shopping or delivery",
             ));
+        }
+        if o.vendor_id.is_some() && v.status == "completed" {
+            let settled: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM vendor_settlements WHERE order_id=?")
+                    .bind(&oid)
+                    .fetch_one(&mut *tx)
+                    .await?;
+            if settled != 1 {
+                return Err(ApiError::conflict(
+                    "Record vendor settlement before completing this order",
+                ));
+            }
         }
         if v.status == "out_for_delivery" && o.courier_id.is_none() {
             return Err(ApiError::conflict("Assign a courier before delivery"));
@@ -343,7 +436,9 @@ pub async fn transition(
 }
 fn shopping(u: &User, o: &Order) -> Result<()> {
     u.require(&["courier", "admin"])?;
-    if o.status != "shopping" || o.payment_status != "paid" {
+    if o.status != "shopping"
+        || !(o.payment_status == "paid" || o.is_cod() && o.payment_status == "cod_pending")
+    {
         return Err(ApiError::conflict("Order must be paid and shopping"));
     }
     Ok(())
@@ -453,6 +548,8 @@ pub async fn reconcile(
     let status = if total > o.authorized_goods_centavos {
         sqlx::query("INSERT INTO adjustments(id,order_id,proposed_goods_centavos,reason) VALUES (?,?,?,'Actual quantity or purchase price changed')").bind(id()).bind(&oid).bind(total).execute(&mut *tx).await?;
         "price_adjustment"
+    } else if o.is_cod() {
+        "ready_for_delivery"
     } else if paid < total + o.delivery_fee_centavos {
         "price_adjustment"
     } else {
@@ -510,7 +607,9 @@ pub async fn decide_adjustment(
             .bind(&oid)
             .execute(&mut *tx)
             .await?;
-        if crate::payments::received(&mut tx, &oid).await? >= total + o.delivery_fee_centavos {
+        if o.is_cod()
+            || crate::payments::received(&mut tx, &oid).await? >= total + o.delivery_fee_centavos
+        {
             history(&mut tx, &u, &oid, "shopping").await?;
         }
     }

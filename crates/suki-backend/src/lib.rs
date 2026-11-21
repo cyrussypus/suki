@@ -3,6 +3,7 @@ pub mod admin;
 pub mod auth;
 pub mod catalog;
 pub mod delivery;
+pub mod media;
 pub mod orders;
 pub mod payments;
 pub mod realtime;
@@ -34,6 +35,8 @@ pub struct AppState {
     pub origin: String,
     pub maps_key: String,
     pub maps_url: String,
+    pub legacy_quotes: bool,
+    pub media_dir: std::path::PathBuf,
     pub events: broadcast::Sender<(String, OrderEvent)>,
 }
 pub type App = Arc<AppState>;
@@ -166,6 +169,26 @@ pub fn router(s: App) -> Router {
         .route("/api/vendor/items", get(vendors::items))
         .route("/api/vendor/items/{id}", put(vendors::confirm))
         .route("/api/health", get(health))
+        .route("/api/vendor/goods/{id}/price", patch(media::change_price))
+        .route(
+            "/api/vendor/goods/{id}/availability",
+            patch(catalog::availability),
+        )
+        .route(
+            "/api/vendor/payment-profile",
+            get(vendors::payment_profile).put(vendors::update_payment_profile),
+        )
+        .route("/api/quotes/delivery", post(delivery::weighted_quote))
+        .route("/api/orders/{id}/chat/ws", get(realtime::websocket))
+        .route("/api/admin/payments/pending", get(payments::pending))
+        .route(
+            "/api/orders/{id}/cash-collection",
+            post(payments::collect_cash),
+        )
+        .route(
+            "/api/orders/{id}/vendor-settlement",
+            post(payments::settle_vendor),
+        )
         .route("/api/auth/register", post(auth::register))
         .route("/api/auth/login", post(auth::login))
         .route("/api/auth/logout", post(auth::logout))
@@ -226,6 +249,16 @@ pub fn router(s: App) -> Router {
         .layer(DefaultBodyLimit::max(32 * 1024))
         .layer(tower_http::trace::TraceLayer::new_for_http())
         .layer(middleware::from_fn_with_state(s.clone(), safety))
+        .merge(
+            Router::new()
+                .route("/api/vendor/goods", post(media::create))
+                .route("/api/vendor/goods/{id}", put(media::edit))
+                .layer(DefaultBodyLimit::max(
+                    suki_shared::catalog::MAX_PHOTO_BYTES + 16 * 1024,
+                ))
+                .layer(middleware::from_fn_with_state(s.clone(), safety)),
+        )
+        .route("/images/vendor/{name}", get(media::photo))
         .with_state(s)
 }
 

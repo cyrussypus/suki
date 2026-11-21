@@ -35,7 +35,8 @@ pub struct Login {
 pub enum Role {
     Customer,
     Vendor,
-    Courier,
+    #[serde(rename = "courier", alias = "rider")]
+    Rider,
     Admin,
 }
 
@@ -44,7 +45,7 @@ impl Role {
         match self {
             Self::Customer => "customer",
             Self::Vendor => "vendor",
-            Self::Courier => "courier",
+            Self::Rider => "courier",
             Self::Admin => "admin",
         }
     }
@@ -83,3 +84,5 @@ impl SessionToken {
         &self.0
     }
 }
+
+pub type UserRole = Role;
