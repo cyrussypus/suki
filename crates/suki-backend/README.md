@@ -62,19 +62,9 @@ All paths begin `/api`. Authenticated calls use `suki_session`; mutations requir
 | POST | `/orders/{id}/expenses` | Courier/admin `{amount_centavos,description}` |
 | GET | `/admin/reports`, `/admin/audit` | Admin profitability, status counts and audit entries |
 
-<!-- coderabbit-ai-generated:v1 -->
-
-<!-- coderabbit-ai-generated-section:v1:e559a3fa94da3c884fc7a99fd53ee583dd2e8661915e5e281d749bd0d36f76f8 -->
-
-<!-- coderabbit-ai-generated:v1 -->
-
-<!-- coderabbit-ai-generated-section:v1:6c16b7e0644d3d9a8e176375209a8d6a4f7136f21bde0c9e2eebf287ca2a4c23 -->
 
 The owning vendor can change stock availability with `PATCH /api/products/{id}/availability` and `{available}`. This leaves other product fields unchanged.
 
-<!-- /coderabbit-ai-generated:v1 -->
-
-<!-- /coderabbit-ai-generated:v1 -->
 
 Principal flow: `awaiting_payment → payment_verification → paid → shopping → ready_for_delivery → out_for_delivery → delivered → completed`. A higher spending authorization pauses shopping in `price_adjustment`; customer approval and verified additional payment resume it. Reconciliation sets `ready_for_delivery`; clients cannot jump directly there. Customers may cancel before shopping; administrators may cancel before delivery completion, creating the remaining refund obligation. Both must wait until pending payment evidence is verified or rejected before canceling.
 
@@ -82,9 +72,7 @@ Principal flow: `awaiting_payment → payment_verification → paid → shopping
 
 Configure a restricted server `GOOGLE_MAPS_API_KEY` with Google Routes `directions/v2:computeRoutes`. The API sends driving origin/destination coordinates and requests `routes.distanceMeters`. It validates coordinate ranges, configured bounding-box coverage and maximum road distance. The default origin is Bankerohan. Administrators must review the origin and coverage against actual operations before launch.
 
-<!-- coderabbit-ai-generated:v1 -->
 
-<!-- coderabbit-ai-generated-section:v1:239fcda9ec8b83951d7be0fd073eb0f44d57ea9463faecbf4aa0e63f6ae61773 -->
 
 Marketplace endpoints (prefix `/api`):
 
@@ -105,7 +93,6 @@ The backend re-encodes vendor photos before serving them and stores them under `
 
 Real Google routing and GCash transactions need provider testing. The database integration test uses its own synthetic Routes server.
 
-<!-- /coderabbit-ai-generated:v1 -->
 
 ## Validation
 
@@ -129,10 +116,7 @@ cargo test --locked -- --include-ignored
 6. Regularly create a separate empty database ending in `_restore`, set `RESTORE_DATABASE`, and run `crates/suki-backend/scripts/restore-test.sh /private/backups/suki.sql.gz`. The script refuses a nonempty target. Compare table counts and important order/payment totals to the source. This restore path was exercised locally against synthetic records; remote scheduling, encryption and recovery objectives remain deployment responsibilities.
 7. Schedule `crates/suki-backend/scripts/prune.sql` daily: expires sessions, old attempt counters/quotes, and chat beyond the configured completed/canceled-order retention (default 30 days). Live locations are deleted at completion/cancellation. Agree on legal retention periods and account erasure procedures for financial/order/audit records before production; do not delete financial evidence ad hoc.
 
-<!-- coderabbit-ai-generated:v1 -->
 
-<!-- coderabbit-ai-generated-section:v1:a716b04dbf9c863a537267d5455551c60a01f525aba4fba5eda398c35d205d92 -->
 
 Before a controlled pilot, finalize substitution, cancellation, payment dispute, and refund procedures. Verify real Google Routes and GCash transactions, test location sharing on devices, and configure monitoring, backups, and privacy controls.
 
-<!-- /coderabbit-ai-generated:v1 -->
