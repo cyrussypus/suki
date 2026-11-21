@@ -30,7 +30,13 @@ For disposable local data, run `SUKI_SEED_LOCAL=1 cargo run --locked -p suki-bac
 
 ## Native mobile builds
 
-Use Dioxus CLI 0.7.10 to match the application. Android requires JDK 17, SDK platform 35, build-tools 35.0.0 and NDK 27.2.12479018; set `ANDROID_HOME` and `NDK_HOME`. iOS requires macOS and Xcode. Device builds need your signing configuration.
+<!-- coderabbit-ai-generated:v1 -->
+
+<!-- coderabbit-ai-generated-section:v1:65f0c168fb6f736320497b04a139360aa5ae1740adfb2536a307e49d7cb53e6f -->
+
+Run the following commands from the workspace root. Use Dioxus CLI 0.7.10 to match the application. Android requires JDK 17, SDK platform 35, build-tools 35.0.0 and NDK 27.2.12479018; set `ANDROID_HOME` and `NDK_HOME`. iOS requires macOS and Xcode. Device builds need your signing configuration.
+
+<!-- /coderabbit-ai-generated:v1 -->
 
 ```sh
 cargo install dioxus-cli --version 0.7.10 --locked
@@ -47,7 +53,13 @@ For native builds, `SUKI_API_URL` is the API origin without a path. Set `SUKI_AP
 
 ## Browser development preview
 
-The same Rust UI can compile to WebAssembly for previewing the flows from a browser. With the API configured for `http://localhost:8080`:
+<!-- coderabbit-ai-generated:v1 -->
+
+<!-- coderabbit-ai-generated-section:v1:25bc8dccfb669f70c3f4e1d8b0863c41ad48c08c89ce7011f896fcd65b9132ec -->
+
+The same Rust UI can compile to WebAssembly for previewing the flows from a browser. Stop the API started above before launching the preview server. Run the following commands from the workspace root, with the API configured for `http://localhost:8080`:
+
+<!-- /coderabbit-ai-generated:v1 -->
 
 ```sh
 rustup target add wasm32-unknown-unknown

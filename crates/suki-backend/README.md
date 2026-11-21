@@ -62,6 +62,20 @@ All paths begin `/api`. Authenticated calls use `suki_session`; mutations requir
 | POST | `/orders/{id}/expenses` | Courier/admin `{amount_centavos,description}` |
 | GET | `/admin/reports`, `/admin/audit` | Admin profitability, status counts and audit entries |
 
+<!-- coderabbit-ai-generated:v1 -->
+
+<!-- coderabbit-ai-generated-section:v1:e559a3fa94da3c884fc7a99fd53ee583dd2e8661915e5e281d749bd0d36f76f8 -->
+
+<!-- coderabbit-ai-generated:v1 -->
+
+<!-- coderabbit-ai-generated-section:v1:6c16b7e0644d3d9a8e176375209a8d6a4f7136f21bde0c9e2eebf287ca2a4c23 -->
+
+The owning vendor can change stock availability with `PATCH /api/products/{id}/availability` and `{available}`. This leaves other product fields unchanged.
+
+<!-- /coderabbit-ai-generated:v1 -->
+
+<!-- /coderabbit-ai-generated:v1 -->
+
 Principal flow: `awaiting_payment → payment_verification → paid → shopping → ready_for_delivery → out_for_delivery → delivered → completed`. A higher spending authorization pauses shopping in `price_adjustment`; customer approval and verified additional payment resume it. Reconciliation sets `ready_for_delivery`; clients cannot jump directly there. Customers may cancel before shopping; administrators may cancel before delivery completion, creating the remaining refund obligation. Both must wait until pending payment evidence is verified or rejected before canceling.
 
 ## Google Maps and GCash

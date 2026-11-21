@@ -55,13 +55,13 @@ impl Api {
         {
             return Err("Suki API needs a web origin without a path".into());
         }
+        if origin.scheme() != "https"
+            && !matches!(origin.host_str(), Some("localhost" | "127.0.0.1" | "[::1]"))
+        {
+            return Err("Use HTTPS for the marketplace API".into());
+        }
         #[cfg(not(target_arch = "wasm32"))]
         {
-            if origin.scheme() != "https"
-                && !matches!(origin.host_str(), Some("localhost" | "127.0.0.1" | "[::1]"))
-            {
-                return Err("Use HTTPS for the marketplace API".into());
-            }
             let cookies = std::sync::Arc::new(reqwest::cookie::Jar::default());
             // Use the same public roots as the native WebSocket transport.
             // Reqwest's Android system verifier would need a separate Java runtime bridge.
@@ -136,7 +136,8 @@ impl Api {
         let mut request = self
             .client
             .request(method, url)
-            .header("X-Suki-Request", "1");
+            .header("X-Suki-Request", "1")
+            .timeout(std::time::Duration::from_secs(15));
         if let Some(body) = body {
             request = request.json(body);
         }

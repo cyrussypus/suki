@@ -25,6 +25,7 @@ enum Page {
 struct State {
     page: Signal<Page>,
     account: Signal<Option<Account>>,
+    signing_out: Signal<bool>,
     catalog: Signal<Vec<Product>>,
     categories: Signal<Vec<String>>,
     settings: Signal<Option<Settings>>,
@@ -45,6 +46,7 @@ fn App() -> Element {
     let mut state = State {
         page: use_signal(|| Page::Market),
         account: use_signal(|| None),
+        signing_out: use_signal(|| false),
         catalog: use_signal(Vec::new),
         categories: use_signal(Vec::new),
         settings: use_signal(|| None),

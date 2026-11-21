@@ -30,6 +30,12 @@ pub struct ProductInput {
     pub available: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProductAvailability {
+    pub available: bool,
+}
+
 #[derive(Debug, Default, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct CatalogFilter {
     pub search: String,

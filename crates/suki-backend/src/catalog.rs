@@ -1,7 +1,7 @@
 use crate::auth::User;
 use crate::*;
 use axum::extract::{Path, State};
-pub use suki_shared::catalog::{Product, ProductInput};
+pub use suki_shared::catalog::{Product, ProductAvailability, ProductInput};
 pub async fn list(State(s): State<App>) -> Result<Json<Vec<Product>>> {
     Ok(Json(
         sqlx::query_as("SELECT p.*,v.shop_name AS vendor FROM products p JOIN vendor_profiles v ON v.user_id=p.vendor_id JOIN users u ON u.id=p.vendor_id WHERE u.status='active' ORDER BY p.id")
@@ -86,6 +86,41 @@ pub async fn update(
         "product.update",
         &pid.to_string(),
         json!({"price_centavos":p.price_centavos,"available":p.available}),
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(Json(Acknowledged { ok: true }))
+}
+
+/// Change only stock availability, preserving any concurrently updated product fields.
+pub async fn availability(
+    State(s): State<App>,
+    u: User,
+    Path(pid): Path<i64>,
+    Json(input): Json<ProductAvailability>,
+) -> Result<Json<Acknowledged>> {
+    u.require(&["vendor"])?;
+    let mut tx = s.db.begin().await?;
+    let owner: Option<String> =
+        sqlx::query_scalar("SELECT vendor_id FROM products WHERE id=? FOR UPDATE")
+            .bind(pid)
+            .fetch_optional(&mut *tx)
+            .await?;
+    if owner.as_deref() != Some(&u.id) {
+        return Err(ApiError::forbidden());
+    }
+    sqlx::query("UPDATE products SET available=?,updated_at=? WHERE id=?")
+        .bind(input.available)
+        .bind(now())
+        .bind(pid)
+        .execute(&mut *tx)
+        .await?;
+    audit(
+        &mut tx,
+        &u.id,
+        "product.availability",
+        &pid.to_string(),
+        json!({"available": input.available}),
     )
     .await?;
     tx.commit().await?;

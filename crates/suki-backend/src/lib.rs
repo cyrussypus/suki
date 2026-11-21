@@ -173,6 +173,10 @@ pub fn router(s: App) -> Router {
         .route("/api/products", get(catalog::list).post(catalog::create))
         .route("/api/products/{id}", put(catalog::update))
         .route(
+            "/api/products/{id}/availability",
+            patch(catalog::availability),
+        )
+        .route(
             "/api/settings",
             get(admin::settings).put(admin::update_settings),
         )

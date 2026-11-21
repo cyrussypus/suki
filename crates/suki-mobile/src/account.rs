@@ -1,10 +1,11 @@
 use crate::{Api, Page, State};
+use dioxus::core::spawn_forever;
 use dioxus::prelude::*;
 use reqwest::Method;
 use suki_shared::{
     Acknowledged,
     auth::{Account, Login, Registration, RegistrationResult, Role},
-    catalog::{Product, ProductInput},
+    catalog::{Product, ProductAvailability},
 };
 
 #[component]
@@ -27,24 +28,34 @@ pub fn AccountScreen() -> Element {
                 p { "{account.name} · {account.role}" }
                 p { "{account.email}" }
                 if !(error)().is_empty() { p { role: "alert", "{error}" } }
-                button { disabled: busy(), onclick: move |_| {
-                    if busy() { return; }
+                button { disabled: (state.signing_out)(), onclick: move |_| {
+                    if (state.signing_out)() { return; }
                     let api = api.clone();
-                    busy.set(true);
-                    spawn(async move {
-                        match api.send::<Acknowledged, _>(Method::POST, "/auth/logout", &()).await {
-                            Ok(_) => {
-                                state.account.set(None);
-                                state.basket.write().clear();
-                                state.favorites.write().clear();
-                                state.active_order.set(None);
-                                state.pending.set(None);
-                                state.page.set(Page::Market);
-                                state.notice.set("Signed out.".into());
+                    state.signing_out.set(true);
+                    spawn_forever(async move {
+                        let result = api.send::<Acknowledged, _>(Method::POST, "/auth/logout", &()).await;
+                        let revoked = match result {
+                            Ok(_) => true,
+                            Err(failure) => {
+                                match api.get::<Account>("/auth/me").await {
+                                    Err(probe) if probe.status == Some(401) => true,
+                                    _ => {
+                                        state.notice.set(failure.to_string());
+                                        false
+                                    }
+                                }
                             }
-                            Err(failure) => error.set(failure.to_string()),
+                        };
+                        if revoked {
+                            state.account.set(None);
+                            state.basket.write().clear();
+                            state.favorites.write().clear();
+                            state.active_order.set(None);
+                            state.pending.set(None);
+                            state.page.set(Page::Market);
+                            state.notice.set("Signed out.".into());
                         }
-                        busy.set(false);
+                        state.signing_out.set(false);
                     });
                 }, "Sign out" }
             }
@@ -152,14 +163,9 @@ fn StockRow(product: Product) -> Element {
                 busy.set(true);
                 let api = api.clone();
                 let id = product.id;
-                let update = ProductInput {
-                    name: product.name.clone(), local_name: product.local_name.clone(),
-                    description: product.description.clone(), category: product.category.clone(),
-                    unit: product.unit.clone(), price_centavos: product.price_centavos,
-                    image: product.image.clone(), available: !available,
-                };
+                let update = ProductAvailability { available: !available };
                 spawn(async move {
-                    match api.send::<Acknowledged, _>(Method::PUT, &format!("/products/{id}"), &update).await {
+                    match api.send::<Acknowledged, _>(Method::PATCH, &format!("/products/{id}/availability"), &update).await {
                         Ok(_) => crate::refresh_catalog(&api, state).await,
                         Err(error) => state.notice.set(error.to_string()),
                     }

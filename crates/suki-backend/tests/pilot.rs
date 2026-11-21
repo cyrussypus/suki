@@ -237,6 +237,65 @@ async fn full_order_and_authorization() {
         .0,
         403
     );
+    // A stale availability action must never restore an older product price.
+    ok(
+        &app,
+        "PUT",
+        &format!("/api/products/{pid}"),
+        &vendor,
+        product(17000),
+    )
+    .await;
+    for denied in [&vendor2, &customer] {
+        assert_eq!(
+            call(
+                &app,
+                "PATCH",
+                &format!("/api/products/{pid}/availability"),
+                denied,
+                json!({"available":false})
+            )
+            .await
+            .0,
+            403
+        );
+    }
+    assert_eq!(
+        call(
+            &app,
+            "PATCH",
+            &format!("/api/products/{pid}/availability"),
+            &vendor,
+            json!({"available":false,"price_centavos":16000})
+        )
+        .await
+        .0,
+        422
+    );
+    ok(
+        &app,
+        "PATCH",
+        &format!("/api/products/{pid}/availability"),
+        &vendor,
+        json!({"available":false}),
+    )
+    .await;
+    let (price, available): (i64, bool) =
+        sqlx::query_as("SELECT price_centavos,available FROM products WHERE id=?")
+            .bind(pid)
+            .fetch_one(&db)
+            .await
+            .unwrap();
+    assert_eq!((price, available), (17000, false));
+    ok(
+        &app,
+        "PUT",
+        &format!("/api/products/{pid}"),
+        &vendor,
+        product(16000),
+    )
+    .await;
+
     let (courier_id, courier_email) = account(&app, "customer").await;
     activate(&app, &admin, &courier_id, "courier").await;
     let courier = login(&app, &courier_email).await;

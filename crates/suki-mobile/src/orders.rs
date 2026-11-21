@@ -43,7 +43,7 @@ pub fn OrderList() -> Element {
     };
     let first = refresh.clone();
     use_effect(move || {
-        if signed_in {
+        if state.account.read().is_some() {
             first();
         } else {
             loading.set(false);
