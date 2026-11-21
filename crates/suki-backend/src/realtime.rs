@@ -11,6 +11,7 @@ use futures_util::{SinkExt, StreamExt};
 pub use suki_shared::realtime::{ChatMessage, Cursor, MessageInput, Position};
 use suki_shared::{
     auth::{SESSION_COOKIE, SessionToken},
+    crypto::{CHAT_AUTH, hash_message},
     realtime::{CourierLocation, LocationSnapshot, PositionResult},
 };
 async fn chat_access(s: &App, u: &User, oid: &str) -> Result<orders::Order> {
@@ -32,6 +33,7 @@ async fn chat_access(s: &App, u: &User, oid: &str) -> Result<orders::Order> {
     }
     Ok(o)
 }
+
 pub async fn messages(
     State(s): State<App>,
     u: User,
@@ -39,7 +41,18 @@ pub async fn messages(
     Query(cursor): Query<Cursor>,
 ) -> Result<Json<Vec<ChatMessage>>> {
     chat_access(&s, &u, &oid).await?;
-    Ok(Json(sqlx::query_as("SELECT m.id,m.order_id,m.sender_id,u.name AS sender_name,COALESCE(m.sender_role,CAST(u.role AS CHAR)) AS sender_role,m.content,m.created_at FROM chat_messages m JOIN users u ON u.id=m.sender_id WHERE order_id=? AND m.id>? ORDER BY m.id LIMIT 200").bind(oid).bind(cursor.after).fetch_all(&s.db).await?))
+    let messages: Vec<ChatMessage> = sqlx::query_as("SELECT m.id,m.order_id,m.sender_id,u.name AS sender_name,COALESCE(m.sender_role,CAST(u.role AS CHAR)) AS sender_role,m.content,m.created_at,m.nonce,m.hash,m.signature FROM chat_messages m JOIN users u ON u.id=m.sender_id WHERE m.order_id=? AND m.id>? ORDER BY m.id LIMIT 200")
+        .bind(oid)
+        .bind(cursor.after)
+        .fetch_all(&s.db)
+        .await?;
+    if messages
+        .iter()
+        .any(|m| !m.is_legacy() && !integrity::valid_message(&s.integrity_key, m))
+    {
+        return Err(ApiError::conflict("Order chat failed its integrity check"));
+    }
+    Ok(Json(messages))
 }
 pub async fn send_message(
     State(s): State<App>,
@@ -47,7 +60,7 @@ pub async fn send_message(
     Path(oid): Path<String>,
     Json(v): Json<MessageInput>,
 ) -> Result<Json<OrderEvent>> {
-    chat_access(&s, &u, &oid).await?;
+    let oid = chat_access(&s, &u, &oid).await?.id;
     let content = text(&v.content, 1, 2000)?;
     let mut tx = s.db.begin().await?;
     if u.role == "vendor" {
@@ -75,19 +88,25 @@ pub async fn send_message(
         ));
     }
     let created = now();
+    let nonce = id();
+    let hash = hash_message(&oid, &u.id, &u.role, &content, created, &nonce);
+    let signature = s.integrity_key.sign(CHAT_AUTH, &hash);
     let row = sqlx::query(
-        "INSERT INTO chat_messages(order_id,sender_id,content,created_at,sender_role) VALUES(?,?,?,?,?)",
+        "INSERT INTO chat_messages(order_id,sender_id,content,created_at,sender_role,nonce,hash,signature) VALUES(?,?,?,?,?,?,?,?)",
     )
     .bind(&oid)
     .bind(&u.id)
     .bind(&content)
     .bind(created)
     .bind(&u.role)
+    .bind(&nonce)
+    .bind(&hash)
+    .bind(&signature)
     .execute(&mut *tx)
     .await?;
     tx.commit().await?;
     let event = OrderEvent::Message {
-        message: ChatMessage {
+        message: Box::new(ChatMessage {
             id: row.last_insert_id().try_into().map_err(|_| {
                 ApiError(
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -100,7 +119,10 @@ pub async fn send_message(
             sender_name: u.name.clone(),
             content,
             created_at: created,
-        },
+            nonce: Some(nonce),
+            hash: Some(hash),
+            signature: Some(signature),
+        }),
     };
     let _ = s.events.send((oid, event.clone()));
     Ok(Json(event))
@@ -183,7 +205,7 @@ pub async fn websocket(
     if headers.get("origin").and_then(|v| v.to_str().ok()) != Some(&s.origin) {
         return Err(ApiError::forbidden());
     }
-    chat_access(&s, &u, &oid).await?;
+    let oid = chat_access(&s, &u, &oid).await?.id;
     let token = crate::auth::session_token(&headers).ok_or_else(ApiError::forbidden)?;
     Ok(ws
         .max_message_size(4096)
@@ -207,6 +229,8 @@ async fn events(socket: WebSocket, s: App, u: User, oid: String, token: SessionT
                         if !session_valid(&s, &u, &oid, &token).await { break; }
                         if matches!(value, OrderEvent::Location(_)) && orders::access(&s, &u, &oid).await.map(|o|o.status!="out_for_delivery").unwrap_or(true) { continue; }
                         if u.role == "vendor" && !matches!(value, OrderEvent::Message { .. } | OrderEvent::Resync) { continue; }
+                        if let OrderEvent::Message { message } = &value
+                            && !integrity::valid_message(&s.integrity_key, message) { continue; }
                         if output.send(Message::Text(serde_json::to_string(&value).expect("serializable order event").into())).await.is_err() { break; }
                     }
                     Err(broadcast::error::RecvError::Lagged(_)) => {

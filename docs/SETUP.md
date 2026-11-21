@@ -24,7 +24,46 @@ chmod 600 .env
 cargo run --locked
 ```
 
+<!-- coderabbit-ai-generated:v1 -->
+
+<!-- coderabbit-ai-generated-section:v1:5f841eed5076108ed2c406ec7f6b23bcc11d6fc286244cdb0ed794a55b54d8f9 -->
+
 The API applies migrations before listening. Check `curl --fail http://localhost:8080/api/health`. From the workspace root use `cargo run --locked -p suki-backend` with variables supplied by the shell or your process manager. The sample environment describes administrator bootstrap. Remove bootstrap credentials after first startup.
+
+<!-- coderabbit-ai-generated:v1 -->
+
+<!-- coderabbit-ai-generated-section:v1:c4d159a8c9d910e71ce26aa9fd0059f154aea0ce299776e5e1feb85ab5e2340e -->
+
+Set `SUKI_INTEGRITY_KEY` before starting or upgrading the API. Generate it once with `openssl rand -hex 32`, keep it in your server secret store and back it up separately from MariaDB. All API instances must use the same key. Replacing it without a migration makes existing signatures fail verification. The migration requires permission to create triggers. Apply schema upgrades with older API instances stopped.
+
+**Recover an interrupted integrity migration.** MariaDB commits schema changes separately, so startup can leave part of migration 0004 or 0005 applied. Before upgrading, stop all API instances and other writers and take a validated database backup. Keep writes stopped until the migrated API passes its health check.
+
+If startup fails during migration, stop retries and keep the failed database for inspection. Check the migration records and which schema objects already exist:
+
+```sql
+SELECT version, success FROM _sqlx_migrations WHERE version IN (4, 5);
+SHOW TABLES LIKE 'order_integrity';
+SHOW TABLES LIKE 'order_snapshots';
+SHOW COLUMNS FROM payments LIKE 'reference_hash';
+SHOW COLUMNS FROM chat_messages LIKE 'signature';
+SHOW TRIGGERS;
+```
+
+Restore the pre-upgrade backup into a fresh database, verify the restored migration records, and run the upgrade there with the original signing key. Switch the API to that database only after the upgrade and health checks pass. Keep the failed database unchanged; if anything wrote to it after the backup, reconcile those writes before switching. Do not mark a partial migration successful or drop tables from the failed database to force a retry.
+
+<!-- /coderabbit-ai-generated:v1 -->
+
+<!-- coderabbit-ai-generated:v1 -->
+
+<!-- coderabbit-ai-generated-section:v1:cb42e4360e03761a12e8e029a3d2625c40a225ae8226f45c8bac2f8d01349a82 -->
+
+Use **Order integrity inspector** on the admin dashboard to inspect a full order ID. The server verifies the transaction chain and stored chat signatures. An unsigned transaction entry indicates a write outside the API and blocks further changes through the API until investigated. Orders and chat created before the migration have no historical proof. The chain detects modification of signed entries and gaps before later entries; a privileged database restore or truncation requires an independent backup or checkpoint to detect. GCash fingerprints reject reuse of a normalized reference. Staff still confirm the transfer directly, as a fingerprint cannot prove receipt.
+
+New checkouts save one signed receipt in `order_snapshots` as part of the order transaction. The receipt locks the listing, vendor, weight, checkout price, payment method and quoted delivery charges. The customer and assigned rider can see this receipt; vendors can see only their own lines. The admin inspector checks the receipt against its signed audit entry. Orders placed before signed receipts were introduced retain their original checkout figures without a signature. The receipt always shows the checkout total. COD collection and vendor settlement continue to use the reconciled amounts displayed separately in the order.
+
+<!-- /coderabbit-ai-generated:v1 -->
+
+<!-- /coderabbit-ai-generated:v1 -->
 
 <!-- coderabbit-ai-generated:v1 -->
 

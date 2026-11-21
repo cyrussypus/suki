@@ -117,6 +117,7 @@ async fn full_order_and_authorization() {
     let task = tokio::spawn(async { axum::serve(listener, fixture).await.unwrap() });
     let s: App = Arc::new(AppState {
         db: db.clone(),
+        integrity_key: suki_shared::crypto::IntegrityKey::from_hex(&"12".repeat(32)).unwrap(),
         client: reqwest::Client::new(),
         secure_cookies: false,
         origin: "http://localhost:3000".into(),
@@ -306,6 +307,7 @@ async fn full_order_and_authorization() {
     ok(&app, "PUT", "/api/settings", &admin, settings).await;
     let unavailable: App = Arc::new(AppState {
         db: db.clone(),
+        integrity_key: s.integrity_key.clone(),
         client: reqwest::Client::new(),
         secure_cookies: false,
         origin: "http://localhost:3000".into(),
@@ -787,7 +789,7 @@ async fn full_order_and_authorization() {
             "POST",
             &format!("{path2}/payments"),
             &customer,
-            json!({"reference":reference,"amount_centavos":66432})
+            json!({"reference":format!("  {}  ",reference.to_lowercase()),"amount_centavos":66432})
         )
         .await
         .0,
@@ -1054,16 +1056,141 @@ async fn marketplace_workflow(
         ),
         (Some(8500), Some(4000))
     );
+    let checkout_body = make_checkout(quote, "cash_on_delivery");
     let order = ok(
         app,
         "POST",
-        "/api/orders",
+        "/api/orders/checkout",
         customer,
-        make_checkout(quote, "cash_on_delivery"),
+        checkout_body.clone(),
     )
     .await;
     let oid = order["id"].as_str().unwrap();
     let path = format!("/api/orders/{oid}");
+    let receipt_path = format!("{path}/receipt");
+    let receipt: suki_shared::snapshots::OrderSnapshot =
+        serde_json::from_value(order["snapshot"].clone()).unwrap();
+    assert!(receipt.valid_digest_for(oid));
+    assert!(state.integrity_key.verify(
+        suki_shared::crypto::SNAPSHOT_AUTH,
+        &receipt.snapshot_hash,
+        &receipt.signature
+    ));
+    assert_eq!(receipt.payload.total_centavos, 58500);
+    assert_eq!(receipt.payload.delivery.total_centavos, 8500);
+    assert_eq!(receipt.payload.delivery.distance_meters, 1234);
+    assert_eq!(receipt.payload.delivery.weight_grams, Some(4000));
+    assert_eq!(receipt.payload.items[0].unit_price_centavos, 25000);
+    assert_eq!(receipt.payload.items[0].unit_weight_grams, 2000);
+
+    // Changing a live listing cannot change the signed receipt or the vendor's locked price.
+    ok(
+        app,
+        "PATCH",
+        &price_path,
+        vendor,
+        json!({"price_centavos":26000}),
+    )
+    .await;
+    ok(
+        app,
+        "PATCH",
+        &format!("/api/vendor/goods/{pid}/availability"),
+        vendor,
+        json!({"available":false}),
+    )
+    .await;
+    assert_eq!(
+        ok(app, "GET", &receipt_path, customer, Value::Null).await,
+        order["snapshot"]
+    );
+    for account in [vendor, rider, stranger] {
+        assert_eq!(
+            call(app, "GET", &receipt_path, account, Value::Null)
+                .await
+                .0,
+            403
+        );
+    }
+    let vendor_queue = ok(app, "GET", "/api/vendor/items", vendor, Value::Null).await;
+    let line = vendor_queue
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["order_id"] == oid)
+        .unwrap();
+    assert_eq!(line["unit_price_centavos"], 25000);
+    assert_eq!(line["line_total_centavos"], 50000);
+    assert_eq!(line["snapshot_verified"], true);
+    assert!(line.get("address").is_none());
+    assert!(line.get("payment_method").is_none());
+
+    let replay = ok(
+        app,
+        "POST",
+        "/api/orders/checkout",
+        customer,
+        checkout_body.clone(),
+    )
+    .await;
+    assert_eq!(replay["id"], oid);
+    assert_eq!(replay["replayed"], true);
+    assert_eq!(replay["snapshot"], order["snapshot"]);
+
+    // If receipt authentication fails, a retry must still recover the committed order.
+    let wrong_key_app = suki_api::router(Arc::new(AppState {
+        integrity_key: suki_shared::crypto::IntegrityKey::from_hex(&"ab".repeat(32)).unwrap(),
+        ..state.clone()
+    }));
+    let recovered = ok(
+        &wrong_key_app,
+        "POST",
+        "/api/orders/checkout",
+        customer,
+        checkout_body,
+    )
+    .await;
+    assert_eq!(recovered["id"], oid);
+    assert_eq!(recovered["replayed"], true);
+    assert_eq!(recovered["snapshot_invalid"], true);
+    assert!(recovered["snapshot"].is_null());
+    assert_eq!(
+        call(&wrong_key_app, "GET", &receipt_path, customer, Value::Null)
+            .await
+            .0,
+        409
+    );
+    assert!(
+        sqlx::query("UPDATE order_snapshots SET payload='{}' WHERE order_id=?")
+            .bind(oid)
+            .execute(&state.db)
+            .await
+            .is_err()
+    );
+    assert!(
+        sqlx::query("DELETE FROM order_snapshots WHERE order_id=?")
+            .bind(oid)
+            .execute(&state.db)
+            .await
+            .is_err()
+    );
+
+    ok(
+        app,
+        "PATCH",
+        &price_path,
+        vendor,
+        json!({"price_centavos":25000}),
+    )
+    .await;
+    ok(
+        app,
+        "PATCH",
+        &format!("/api/vendor/goods/{pid}/availability"),
+        vendor,
+        json!({"available":true}),
+    )
+    .await;
     let assign = format!("{path}/assign");
     let status = format!("{path}/status");
     ok(app, "PUT", &assign, admin, json!({"courier_id":rider_id})).await;
@@ -1131,6 +1258,17 @@ async fn marketplace_workflow(
             assert_eq!(response["message"]["content"], content);
             assert_eq!(response["message"]["sender_role"], role);
             assert_eq!(response["message"]["order_id"], oid);
+            let mut message: suki_shared::realtime::ChatMessage =
+                serde_json::from_value(response["message"].clone()).unwrap();
+            assert!(suki_api::integrity::valid_message(
+                &state.integrity_key,
+                &message
+            ));
+            message.content.push('!');
+            assert!(!suki_api::integrity::valid_message(
+                &state.integrity_key,
+                &message
+            ));
         }
     }
 
@@ -1224,6 +1362,7 @@ async fn marketplace_workflow(
     .await;
     ok(app, "PATCH", &status, rider, json!({"status":"completed"})).await;
     let delivered = ok(app, "GET", &path, customer, Value::Null).await;
+    assert_eq!(delivered["snapshot"], order["snapshot"]);
     assert_eq!(delivered["settlement"]["amount_centavos"], 49000);
     assert_eq!(delivered["payments"][0]["received_amount_centavos"], 57500);
 
@@ -1284,7 +1423,8 @@ async fn marketplace_workflow(
             .as_array()
             .unwrap()
             .iter()
-            .any(|p| p["id"] == evidence["id"])
+            .any(|p| p["id"] == evidence["id"]
+                && p["reference_hash"] == suki_shared::crypto::gcash_reference_hash(&reference))
     );
     ok(
         app,
@@ -1298,5 +1438,78 @@ async fn marketplace_workflow(
         ok(app, "GET", &direct, customer, Value::Null).await["order"]["status"],
         "paid"
     );
+    let integrity_path = format!("/api/admin/orders/{oid}/integrity");
+    assert_eq!(
+        call(app, "GET", &integrity_path, customer, Value::Null)
+            .await
+            .0,
+        403
+    );
+    let report = ok(app, "GET", &integrity_path, admin, Value::Null).await;
+    assert_eq!(report["messages_verified"], 3);
+    assert_eq!(report["snapshot"], "verified");
+    assert_eq!(report["legacy_messages"], 0);
+    assert!(report["transactions_verified"].as_u64().unwrap() >= 8);
+    assert!(report["first_invalid_transaction"].is_null());
+    assert!(report["first_invalid_message"].is_null());
+    let entries = report["recent"].as_array().unwrap();
+    assert!(
+        entries
+            .iter()
+            .any(|entry| entry["event"] == "payments.insert")
+    );
+    assert!(
+        entries
+            .iter()
+            .any(|entry| entry["event"] == "vendor_settlements.insert")
+    );
+    assert!(
+        sqlx::query("UPDATE order_integrity SET payload='{}' WHERE order_id=?")
+            .bind(oid)
+            .execute(&state.db)
+            .await
+            .is_err()
+    );
+    assert!(
+        sqlx::query("DELETE FROM order_integrity WHERE order_id=?")
+            .bind(oid)
+            .execute(&state.db)
+            .await
+            .is_err()
+    );
+    assert!(
+        sqlx::query("UPDATE chat_messages SET content='changed' WHERE order_id=?")
+            .bind(oid)
+            .execute(&state.db)
+            .await
+            .is_err()
+    );
+
+    // Confirm this paid order is assignable before testing the integrity guard.
+    let assignment = format!("{direct}/assign");
+    let rider_assignment = json!({"courier_id":rider_id});
+    ok(app, "PUT", &assignment, admin, rider_assignment.clone()).await;
+    let paid_order_id = detail["order"]["id"].as_str().unwrap();
+    let integrity_path = format!("/api/admin/orders/{paid_order_id}/integrity");
+    let before = ok(app, "GET", &integrity_path, admin, Value::Null).await;
+    assert!(before["first_invalid_transaction"].is_null());
+
+    // A database edit creates an unsigned entry. A later API action must not seal it.
+    sqlx::query("UPDATE orders SET delivery_fee_centavos=delivery_fee_centavos+1 WHERE id=?")
+        .bind(paid_order_id)
+        .execute(&state.db)
+        .await
+        .unwrap();
+    let report = ok(app, "GET", &integrity_path, admin, Value::Null).await;
+    assert!(report["first_invalid_transaction"].is_number());
+    let (status, error, _) = call(app, "PUT", &assignment, admin, rider_assignment).await;
+    assert_eq!(status, 409);
+    assert_eq!(error["error"], "Order integrity needs administrator review");
+    let after = ok(app, "GET", &integrity_path, admin, Value::Null).await;
+    assert_eq!(
+        report["first_invalid_transaction"],
+        after["first_invalid_transaction"]
+    );
+
     tokio::fs::remove_dir_all(&state.media_dir).await.unwrap();
 }

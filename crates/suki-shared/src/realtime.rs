@@ -10,6 +10,38 @@ pub struct ChatMessage {
     pub sender_name: String,
     pub content: String,
     pub created_at: i64,
+    #[serde(default)]
+    pub nonce: Option<String>,
+    #[serde(default)]
+    pub hash: Option<String>,
+    #[serde(default)]
+    pub signature: Option<String>,
+}
+
+impl ChatMessage {
+    pub fn computed_hash(&self) -> Option<String> {
+        Some(crate::crypto::hash_message(
+            &self.order_id,
+            &self.sender_id,
+            &self.sender_role,
+            &self.content,
+            self.created_at,
+            self.nonce.as_deref()?,
+        ))
+    }
+
+    pub fn is_legacy(&self) -> bool {
+        self.nonce.is_none() && self.hash.is_none() && self.signature.is_none()
+    }
+
+    pub fn valid_digest(&self) -> bool {
+        match (self.computed_hash(), &self.hash, &self.signature) {
+            (Some(computed), Some(stored), Some(_)) => {
+                crate::crypto::verify_hash(&computed, stored)
+            }
+            _ => false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
@@ -55,7 +87,7 @@ pub enum LocationSnapshot {
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum OrderEvent {
-    Message { message: ChatMessage },
+    Message { message: Box<ChatMessage> },
     Location(CourierLocation),
     Status { status: String },
     Resync,

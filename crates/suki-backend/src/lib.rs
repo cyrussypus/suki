@@ -3,10 +3,12 @@ pub mod admin;
 pub mod auth;
 pub mod catalog;
 pub mod delivery;
+pub mod integrity;
 pub mod media;
 pub mod orders;
 pub mod payments;
 pub mod realtime;
+pub mod snapshots;
 pub mod vendors;
 
 use axum::{
@@ -30,6 +32,7 @@ use tokio::sync::broadcast;
 #[derive(Clone)]
 pub struct AppState {
     pub db: MySqlPool,
+    pub integrity_key: suki_shared::crypto::IntegrityKey,
     pub client: reqwest::Client,
     pub secure_cookies: bool,
     pub origin: String,
@@ -205,6 +208,8 @@ pub fn router(s: App) -> Router {
         )
         .route("/api/delivery/quote", post(delivery::quote))
         .route("/api/orders", get(orders::list).post(orders::create))
+        .route("/api/orders/checkout", post(orders::create))
+        .route("/api/orders/{id}/receipt", get(snapshots::get))
         .route("/api/orders/{id}", get(orders::detail))
         .route("/api/orders/{id}/status", patch(orders::transition))
         .route("/api/orders/{id}/assign", put(orders::assign))
@@ -245,6 +250,7 @@ pub fn router(s: App) -> Router {
         .route("/api/admin/users/{id}", patch(admin::update_user))
         .route("/api/admin/reports", get(admin::reports))
         .route("/api/admin/audit", get(admin::logs))
+        .route("/api/admin/orders/{id}/integrity", get(integrity::inspect))
         .route("/api/orders/{id}/expenses", post(admin::expense))
         .layer(DefaultBodyLimit::max(32 * 1024))
         .layer(tower_http::trace::TraceLayer::new_for_http())

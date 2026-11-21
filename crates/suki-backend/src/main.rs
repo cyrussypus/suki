@@ -9,6 +9,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .unwrap_or_else(|_| "suki_api=info".into()),
         )
         .init();
+    let integrity_key = suki_shared::crypto::IntegrityKey::from_hex(
+        &std::env::var("SUKI_INTEGRITY_KEY")
+            .map_err(|_| "Set SUKI_INTEGRITY_KEY before starting the API")?,
+    )
+    .map_err(|_| "SUKI_INTEGRITY_KEY must be 32 bytes encoded as 64 hex characters")?;
     let db = sqlx::mysql::MySqlPoolOptions::new()
         .max_connections(15)
         .connect(&std::env::var("DATABASE_URL")?)
@@ -24,6 +29,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let s = Arc::new(AppState {
         db,
+        integrity_key,
         client: reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(12))
             .build()?,

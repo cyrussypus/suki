@@ -300,6 +300,12 @@ fn IncomingRow(
     rsx! {
         article { class: "order-link",
             p { "{row.name} · {row.quantity_milli} thousandths of {row.unit} · {row.order_status}" }
+            if let (Some(unit_price), Some(line_total)) = (row.unit_price_centavos, row.line_total_centavos) {
+                p {
+                    if row.snapshot_verified { "Locked at checkout: " } else { "Original order price: " }
+                    "{peso(unit_price)} per {row.unit} · {peso(line_total)} for this line"
+                }
+            }
             if row.chat_enabled { button { onclick: move |_| onchat.call(row.order_id.clone()), "Open order chat" } }
             if can_confirm {
                 form { onsubmit: move |e| {

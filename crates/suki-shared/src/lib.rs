@@ -2,11 +2,13 @@ pub mod addresses;
 pub mod admin;
 pub mod auth;
 pub mod catalog;
+pub mod crypto;
 pub mod delivery;
 pub mod orders;
 pub mod payments;
 pub mod pricing;
 pub mod realtime;
+pub mod snapshots;
 pub mod vendors;
 
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]

@@ -122,6 +122,8 @@ pub type StatusEntry = (String, String, i64);
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 pub struct OrderDetail {
     pub order: Order,
+    #[serde(default)]
+    pub snapshot: Option<crate::snapshots::OrderSnapshot>,
     pub items: Vec<Item>,
     pub payments: Vec<crate::payments::Payment>,
     pub refunds: Vec<Refund>,
@@ -135,6 +137,10 @@ pub struct OrderDetail {
 pub struct CheckoutResult {
     pub id: String,
     pub replayed: bool,
+    #[serde(default)]
+    pub snapshot_invalid: bool,
+    #[serde(default)]
+    pub snapshot: Option<crate::snapshots::OrderSnapshot>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

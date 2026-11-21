@@ -152,7 +152,8 @@ pub async fn expense(
     Json(v): Json<Expense>,
 ) -> Result<Json<Created<String>>> {
     u.require(&["admin", "courier"])?;
-    let o = crate::orders::access(&s, &u, &oid).await?;
+    let mut tx = s.db.begin().await?;
+    let o = crate::orders::locked(&mut tx, &u, &oid).await?;
     if u.role == "courier" && o.courier_id.as_deref() != Some(&u.id) {
         return Err(ApiError::forbidden());
     }
@@ -160,7 +161,6 @@ pub async fn expense(
         return Err(ApiError::bad("Invalid expense amount"));
     }
     let desc = text(&v.description, 2, 500)?;
-    let mut tx = s.db.begin().await?;
     let eid = id();
     sqlx::query("INSERT INTO expenses VALUES (?,?,?,?,?,?)")
         .bind(&eid)
@@ -179,6 +179,6 @@ pub async fn expense(
         json!({"order_id":oid,"amount_centavos":v.amount_centavos}),
     )
     .await?;
-    tx.commit().await?;
+    integrity::commit(tx, &s.integrity_key, &o.id, &u.id).await?;
     Ok(Json(Created { id: eid }))
 }

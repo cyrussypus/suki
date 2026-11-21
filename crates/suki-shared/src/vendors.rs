@@ -23,4 +23,9 @@ pub struct VendorItem {
     pub order_status: String,
     pub chat_enabled: bool,
     pub available_quantity_milli: Option<i64>,
+    pub unit_price_centavos: Option<i64>,
+    pub line_total_centavos: Option<i64>,
+    #[serde(default)]
+    #[cfg_attr(feature = "sqlx", sqlx(skip))]
+    pub snapshot_verified: bool,
 }

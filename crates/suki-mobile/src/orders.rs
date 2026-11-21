@@ -16,6 +16,7 @@ use suki_shared::{
         ChatMessage, CourierLocation, LocationSnapshot, MessageInput, OrderEvent, Position,
         PositionResult,
     },
+    snapshots::OrderSnapshot,
 };
 
 #[component]
@@ -73,7 +74,7 @@ pub fn OrderList() -> Element {
                     button { class: "order-link line", key: "{order.id}",
                         onclick: move |_| state.active_order.set(Some(order.id.clone())),
                         span { strong { "Order {short(&order.id)}" } small { "{label(&order.status)}" } }
-                        strong { "{peso(order.estimated_total_centavos)}" }
+                        strong { "At checkout: {peso(order.estimated_total_centavos)}" }
                     }
                 }
             }
@@ -181,6 +182,7 @@ pub fn OrderScreen(id: String) -> Element {
                 p { class: "eyebrow", "MARKET ORDER" }
                 h1 { "Order {short(&data.order.id)}" }
                 strong { class: "badge", "{label(&data.order.status)}" }
+                if data.snapshot.is_none() {
                 p { "{data.order.address}" }
                 for item in data.items.iter() {
                     div { class: "line", key: "{item.id}",
@@ -191,9 +193,13 @@ pub fn OrderScreen(id: String) -> Element {
                 div { class: "line", span { "Estimated goods" } strong { "{peso(data.order.goods_subtotal_centavos)}" } }
                 div { class: "line", span { "Delivery" } strong { "{peso(data.order.delivery_fee_centavos)}" } }
                 div { class: "line totals", span { "Estimated total" } strong { "{peso(data.order.estimated_total_centavos)}" } }
+                }
                 if let Some(final_goods) = data.order.final_goods_centavos {
                     p { "Final goods: {peso(final_goods)}" }
                 }
+            }
+            if let Some(snapshot) = &data.snapshot {
+                CheckoutReceipt { snapshot: snapshot.clone(), order_id: data.order.id.clone(), payment_status: data.order.payment_status.clone() }
             }
             Payment { data: data.clone(), path: path.clone(), detail }
             if let Some(account) = user.clone().filter(|u| u.has_role(Role::Admin) || u.has_role(Role::Rider)) {
@@ -309,6 +315,10 @@ pub(crate) async fn catch_up(
             .await
         {
             Ok(page) => {
+                if page.iter().any(|m| !m.is_legacy() && !m.valid_digest()) {
+                    problem.set("Chat message failed its integrity check.".into());
+                    break;
+                }
                 let count = page.len();
                 if let Some(last) = page.last() {
                     *cursor = last.id;
@@ -344,6 +354,7 @@ pub(crate) fn Chat(path: String, messages: Signal<Vec<ChatMessage>>) -> Element 
                     article { key: "{message.id}",
                         strong { "{message.sender_name} · " if message.sender_role == "courier" { "rider" } else { "{message.sender_role}" } } small { "{date(message.created_at)}" }
                         p { "{message.content}" }
+                        if message.is_legacy() { small { "Historical message · no integrity hash" } }
                     }
                 }
             }
@@ -367,6 +378,47 @@ pub(crate) fn Chat(path: String, messages: Signal<Vec<ChatMessage>>) -> Element 
                 button { class: "primary", disabled: busy() || text().trim().is_empty(), "Send message" }
             }
             if !(error)().is_empty() { p { role: "alert", "{error}" } }
+        }
+    }
+}
+
+#[component]
+fn CheckoutReceipt(snapshot: OrderSnapshot, order_id: String, payment_status: String) -> Element {
+    let valid = snapshot.valid_digest_for(&order_id);
+    let receipt = &snapshot.payload;
+    let delivery = &receipt.delivery;
+    rsx! {
+        section { class: "panel",
+            h2 { "Checkout receipt" }
+            if !valid {
+                p { role: "alert", "This receipt failed its integrity check." }
+            } else {
+                strong { class: "badge", "Verified receipt" }
+                p { "{receipt.address} · {date(receipt.created_at)}" }
+                for item in &receipt.items {
+                    div { class: "line", key: "{item.item_id}",
+                        span { "{item.name} · {item.vendor_name} · {quantity(item.quantity_milli)} {item.unit} × {peso(item.unit_price_centavos)}" }
+                        strong { "{peso(item.line_total_centavos)}" }
+                    }
+                    small { "{item.unit_weight_grams} g per {item.unit}" }
+                }
+                div { class: "line", span { "Goods at checkout" } strong { "{peso(receipt.goods_subtotal_centavos)}" } }
+                div { class: "line", span { "Road distance ({delivery.distance_meters} m)" } strong { "{peso(delivery.distance_charge_centavos())}" } }
+                if let Some(weight) = delivery.weight_grams {
+                    div { class: "line", span { "Weight charge ({weight} g)" } strong { "{peso(delivery.weight_charge_centavos())}" } }
+                    if let Some(floor) = delivery.floor_centavos {
+                        div { class: "line", span { "Bankerohan minimum ({peso(floor)}) top-up" } strong { "{peso(delivery.floor_top_up_centavos)}" } }
+                    }
+                } else {
+                    div { class: "line", span { "Legacy delivery base fee" } strong { "{peso(delivery.legacy_base_centavos)}" } }
+                }
+                div { class: "line", span { "Delivery fee" } strong { "{peso(delivery.total_centavos)}" } }
+                div { class: "line totals", span { "Locked checkout total" } strong { "{peso(receipt.total_centavos)}" } }
+                p { if receipt.payment_method == suki_shared::payments::PaymentMethod::CashOnDelivery { "Cash on delivery" } else { "GCash" }
+                    " · Current payment status: {label(&payment_status)}"
+                }
+                details { summary { "Receipt fingerprint" } code { "{snapshot.snapshot_hash}" } }
+            }
         }
     }
 }
