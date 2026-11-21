@@ -108,6 +108,13 @@ fn ProductCard(product: Product) -> Element {
                     button { class: "primary", disabled: !product.available || state.pending.read().is_some(),
                         aria_label: "Add {product.name} to basket",
                         onclick: move |_| {
+                            let has_other_vendor = state.basket.read().iter().any(|item| {
+                                state.catalog.read().iter().any(|p| p.id == item.product_id && p.vendor_id != product.vendor_id)
+                            });
+                            if has_other_vendor {
+                                state.notice.set("Finish this stall's basket before adding products from another vendor.".into());
+                                return;
+                            }
                             let mut basket = state.basket.write();
                             if let Some(item) = basket.iter_mut().find(|item| item.product_id == id) {
                                 item.quantity_milli = (item.quantity_milli + 1000).min(MAX_QUANTITY_MILLI);

@@ -8,6 +8,10 @@ pub struct Order {
     pub courier_id: Option<String>,
     pub status: String,
     pub payment_status: String,
+    pub payment_method: String,
+    pub vendor_id: Option<String>,
+    pub gcash_number: Option<String>,
+    pub weight_grams: Option<i64>,
     pub address: String,
     pub lat: f64,
     pub lng: f64,
@@ -20,6 +24,12 @@ pub struct Order {
     pub created_at: i64,
     pub updated_at: i64,
     pub delivered_at: Option<i64>,
+}
+
+impl Order {
+    pub fn is_cod(&self) -> bool {
+        self.payment_method == crate::payments::PaymentMethod::CashOnDelivery.as_str()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
@@ -53,6 +63,12 @@ pub struct Checkout {
     pub quote_id: String,
     pub idempotency_key: String,
     pub items: Vec<CheckoutItem>,
+    #[serde(default, skip_serializing_if = "is_gcash")]
+    pub payment_method: crate::payments::PaymentMethod,
+}
+
+fn is_gcash(method: &crate::payments::PaymentMethod) -> bool {
+    *method == crate::payments::PaymentMethod::Gcash
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
@@ -112,6 +128,7 @@ pub struct OrderDetail {
     pub adjustments: Vec<Adjustment>,
     pub substitutions: Vec<SubstitutionRecord>,
     pub history: Vec<StatusEntry>,
+    pub settlement: Option<crate::payments::VendorSettlement>,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
@@ -130,4 +147,20 @@ pub struct Reconciliation {
     pub status: String,
     pub final_goods_centavos: i64,
     pub difference_centavos: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OrderStatus {
+    AwaitingPayment,
+    PaymentVerification,
+    Paid,
+    Confirmed,
+    Shopping,
+    PriceAdjustment,
+    ReadyForDelivery,
+    OutForDelivery,
+    Delivered,
+    Completed,
+    Canceled,
 }

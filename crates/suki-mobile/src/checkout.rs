@@ -5,8 +5,12 @@ use suki_shared::{
     addresses::Address,
     auth::Role,
     catalog::BasketLine,
-    delivery::{DeliveryQuote, Destination},
+    delivery::{
+        DeliveryQuote, MAX_CART_WEIGHT_GRAMS, WeightedDestination, grams_rounded_up,
+        line_weight_milligrams,
+    },
     orders::{Checkout, CheckoutItem, CheckoutResult},
+    payments::PaymentMethod,
     pricing::{MAX_QUANTITY_MILLI, cost, permits_goods_subtotal, peso},
 };
 
@@ -17,6 +21,7 @@ pub fn Basket() -> Element {
     let mut address = use_signal(String::new);
     let mut latitude = use_signal(String::new);
     let mut longitude = use_signal(String::new);
+    let mut payment = use_signal(|| PaymentMethod::CashOnDelivery);
     let mut quote = use_signal(|| None::<DeliveryQuote>);
     let mut addresses = use_signal(Vec::<Address>::new);
     let mut error = use_signal(String::new);
@@ -58,13 +63,23 @@ pub fn Basket() -> Element {
                 && product.price_centavos == line.price_centavos
         })
     });
-    let quoted = (quote)();
+    let mut vendors = std::collections::BTreeSet::new();
+    let milligrams: i64 = lines
+        .iter()
+        .filter_map(|line| {
+            let product = catalog.iter().find(|p| p.id == line.product_id)?;
+            vendors.insert(&product.vendor_id);
+            line_weight_milligrams(product.weight_grams, line.quantity_milli)
+        })
+        .sum();
+    let weight_grams = grams_rounded_up(milligrams);
+    let single_vendor = vendors.len() == 1;
+    let valid_weight = (1..=MAX_CART_WEIGHT_GRAMS).contains(&weight_grams);
+    let quoted = (quote)().filter(|q| q.weight_grams == Some(weight_grams));
     let can_checkout = minimum_met
         && !has_changes
-        && !lines.is_empty()
-        && settings
-            .as_ref()
-            .is_some_and(|s| !s.gcash_qr_url.is_empty())
+        && single_vendor
+        && valid_weight
         && quoted.as_ref().is_some_and(|q| q.expires_at > now());
     let quote_api = api.clone();
     rsx! {
@@ -76,9 +91,11 @@ pub fn Basket() -> Element {
             div { class: "line totals", span { "Goods subtotal" } strong { "{peso(subtotal)}" } }
             if let Some(settings) = settings {
                 p { class: "muted", "Minimum goods order: {peso(settings.minimum_centavos)}. Delivery is separate." }
-                if settings.gcash_qr_url.is_empty() {
-                    p { class: "notice", "Checkout is unavailable until the operator configures GCash." }
-                }
+            }
+            if !lines.is_empty() {
+                p { "Estimated weight: {weight_grams} g" }
+                if !single_vendor { p { class: "notice", "Choose items from one vendor stall per order." } }
+                if !valid_weight { p { class: "notice", "The basket must weigh between 1 g and 100 kg." } }
             }
             if has_changes && allow_edit {
                 p { class: "notice", "The catalog changed. Review affected items before you continue." }
@@ -104,13 +121,14 @@ pub fn Basket() -> Element {
                                 error.set("Enter valid latitude and longitude.".into());
                                 return;
                             }
-                            let destination = Destination { address: address(), lat, lng };
+                            if !single_vendor || !valid_weight || has_changes { return; }
+                            let destination = WeightedDestination { address: address(), lat, lng, weight_grams };
                             let api = quote_api.clone();
                             quote.set(None);
                             busy.set(true);
                             error.set(String::new());
                             spawn(async move {
-                                match api.send(Method::POST, "/delivery/quote", &destination).await {
+                                match api.send(Method::POST, "/quotes/delivery", &destination).await {
                                     Ok(result) => quote.set(Some(result)),
                                     Err(failure) => error.set(failure.to_string()),
                                 }
@@ -140,9 +158,18 @@ pub fn Basket() -> Element {
                                 label { "Latitude" input { required: true, inputmode: "decimal", value: "{latitude}", oninput: move |e| { latitude.set(e.value()); quote.set(None); } } }
                                 label { "Longitude" input { required: true, inputmode: "decimal", value: "{longitude}", oninput: move |e| { longitude.set(e.value()); quote.set(None); } } }
                             }
-                            button { r#type: "submit", "Get road distance quote" }
+                            button { r#type: "submit", disabled: !single_vendor || !valid_weight || has_changes, "Get Bankerohan delivery quote" }
                         }
                     }
+                    label { "Payment method"
+                        select { disabled: !allow_edit, value: payment().as_str(), onchange: move |e| {
+                            payment.set(if e.value() == "gcash" { PaymentMethod::Gcash } else { PaymentMethod::CashOnDelivery });
+                        },
+                            option { value: "cash_on_delivery", "Cash on delivery" }
+                            option { value: "gcash", "GCash transfer to vendor" }
+                        }
+                    }
+                    p { class: "muted", "Delivery: ₱85.00 minimum · ₱7.00/km · ₱5.00/kg." }
                     if let Some(q) = &quoted {
                         div { class: "line", span { "Road distance" } strong { "{q.distance_meters} m" } }
                         div { class: "line", span { "Delivery fee" } strong { "{peso(q.delivery_fee_centavos)}" } }
@@ -158,12 +185,13 @@ pub fn Basket() -> Element {
                         let request = if let Some(existing) = (state.pending)() {
                             existing
                         } else {
-                            let Some(q) = (quote)().filter(|q| q.expires_at > now()) else {
+                            let Some(q) = (quote)().filter(|q| q.expires_at > now() && q.weight_grams == Some(weight_grams)) else {
                                 error.set("The quote expired. Get an updated quote.".into());
                                 return;
                             };
                             Checkout {
                                 quote_id: q.id,
+                                payment_method: payment(),
                                 idempotency_key: uuid::Uuid::new_v4().to_string(),
                                 items: lines.iter().map(|line| CheckoutItem {
                                     product_id: line.product_id, quantity_milli: line.quantity_milli,
@@ -181,7 +209,10 @@ pub fn Basket() -> Element {
                                     state.pending.set(None);
                                     state.basket.write().clear();
                                     state.active_order.set(Some(result.id));
-                                    state.notice.set("Order placed. Submit your GCash reference from the order.".into());
+                                    state.notice.set(match request.payment_method {
+                                        PaymentMethod::Gcash => "Order placed. Open the order to see the vendor's GCash number and submit your reference.",
+                                        PaymentMethod::CashOnDelivery => "Order placed. Pay your rider when your order arrives.",
+                                    }.into());
                                     state.page.set(Page::Orders);
                                 }
                                 Err(failure) => {

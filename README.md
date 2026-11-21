@@ -22,7 +22,13 @@ cargo test --locked
 cargo test --locked -- --include-ignored
 ```
 
-The mobile app includes customer shopping and order management, vendor stock controls, and assigned courier location reporting. Admin operations are available through the API. Checkout requires a configured Google Routes key and the operator’s actual GCash QR. Mobile sessions, favorites and baskets are held in memory while the app runs.
+<!-- coderabbit-ai-generated:v1 -->
+
+<!-- coderabbit-ai-generated-section:v1:231cd10aab7f0da5dea26f52ba009b500df6ab4d06a72b22ec0a25882a9a5f87 -->
+
+Suki has separate customer, vendor, rider, and admin dashboards. Vendors build the catalog by uploading product photos and setting prices, weights, and availability. Customers choose direct GCash or cash on delivery. Orders from a single stall have private chat between the customer, vendor, and assigned rider. Checkout requires a Google Routes key. Mobile sessions, favorites, and baskets are held in memory while the app runs.
+
+<!-- /coderabbit-ai-generated:v1 -->
 
 
 <!-- /coderabbit-ai-generated:v1 -->

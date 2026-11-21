@@ -26,7 +26,13 @@ cargo run --locked
 
 The API applies migrations before listening. Check `curl --fail http://localhost:8080/api/health`. From the workspace root use `cargo run --locked -p suki-backend` with variables supplied by the shell or your process manager. The sample environment describes administrator bootstrap. Remove bootstrap credentials after first startup.
 
-For disposable local data, run `SUKI_SEED_LOCAL=1 cargo run --locked -p suki-backend --example seed_local` with the local `DATABASE_URL` set. The seed adds a synthetic vendor and products.
+<!-- coderabbit-ai-generated:v1 -->
+
+<!-- coderabbit-ai-generated-section:v1:288da9c549abacfcb9aef48d640a4c9e997f1b06e92f15e32e9af6582ba5663f -->
+
+The catalog starts empty. Register a vendor account, activate it in the admin dashboard, then sign in as the vendor and upload a product. Set `SUKI_MEDIA_DIR` to a writable, persistent directory and include it in backups.
+
+<!-- /coderabbit-ai-generated:v1 -->
 
 ## Native mobile builds
 
@@ -73,9 +79,17 @@ Open `http://localhost:8080`. The API serves the generated browser build, images
 
 ## Delivery, payments and operations
 
-Set `GOOGLE_MAPS_API_KEY` on the API. The server verifies driving distance and enforces service coverage and minimum goods subtotal. Mobile checkout accepts an address and coordinates or an existing saved address. The assigned courier can report coordinates during active delivery.
+<!-- coderabbit-ai-generated:v1 -->
 
-Serve the operator’s actual GCash QR in `SUKI_IMAGE_DIR` or the backend’s `assets/images`, and set its `/images/...` URL in the administrator settings API. The customer submits a reference for the outstanding amount. The administrator verifies the actual transfer before shopping can start.
+<!-- coderabbit-ai-generated-section:v1:149c7c8ca4c59bce806582c1139fe9c57d8fb418964dc1f4894206cdd3afc079 -->
+
+Set `GOOGLE_MAPS_API_KEY` on the API. New quotes use Google Routes driving distance from Bankerohan Market and the estimated basket weight: ₱85 minimum, ₱7/km, plus ₱5/kg. Checkout confirms that all items belong to one stall and revalidates the weight against the current product records. The existing goods minimum still applies.
+
+Vendors configure a GCash mobile number in their dashboard. Customers transfer the order total to that number and submit a reference for manual review by the assigned rider or an administrator. For COD, the rider records the exact cash collected, including delivery, at handoff. The rider records the vendor settlement after delivery. The app records payments and settlements; it does not move money. The operator and vendor must agree how to remit the delivery portion and handle refunds for direct transfers.
+
+Riders can enable location sharing on the active delivery screen. Leaving that screen stops updates. Android 11 and newer request fresh fixes; Android 9–10 can report fresh cached fixes or manual coordinates. iOS uses foreground Core Location. This directory does not include a production payment provider integration.
+
+<!-- /coderabbit-ai-generated:v1 -->
 
 See [Backend operations](../crates/suki-backend/README.md#deployment-backups-and-operations) and [Architecture](ARCHITECTURE.md).
 

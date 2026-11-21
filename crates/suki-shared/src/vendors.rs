@@ -12,7 +12,7 @@ pub struct Category {
     pub name: String,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[cfg_attr(feature = "sqlx", derive(sqlx::FromRow))]
 pub struct VendorItem {
     pub item_id: String,
@@ -21,5 +21,6 @@ pub struct VendorItem {
     pub quantity_milli: i64,
     pub unit: String,
     pub order_status: String,
+    pub chat_enabled: bool,
     pub available_quantity_milli: Option<i64>,
 }

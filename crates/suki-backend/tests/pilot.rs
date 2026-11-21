@@ -122,6 +122,8 @@ async fn full_order_and_authorization() {
         origin: "http://localhost:3000".into(),
         maps_key: "synthetic-test-key".into(),
         maps_url: format!("http://{address}/route"),
+        legacy_quotes: true,
+        media_dir: std::env::temp_dir().join(format!("suki-media-{}", id())),
         events: tokio::sync::broadcast::channel(256).0,
     });
     let app = suki_api::router(s.clone());
@@ -309,6 +311,8 @@ async fn full_order_and_authorization() {
         origin: "http://localhost:3000".into(),
         maps_key: String::new(),
         maps_url: "http://127.0.0.1:1".into(),
+        legacy_quotes: true,
+        media_dir: std::env::temp_dir().join(format!("suki-media-{}", id())),
         events: tokio::sync::broadcast::channel(4).0,
     });
     assert_eq!(
@@ -882,6 +886,15 @@ async fn full_order_and_authorization() {
     .await;
     let canceled = ok(&app, "GET", &path2, &customer, Value::Null).await;
     assert_eq!(canceled["refunds"][0][1], 69432);
+    marketplace_workflow(
+        &app,
+        s.as_ref(),
+        live_address,
+        [&customer, &vendor, &courier, &admin, &vendor2],
+        &courier_id,
+    )
+    .await;
+
     activate(&app, &admin, &vendor2_id, "vendor").await;
     assert_eq!(
         call(&app, "GET", "/api/auth/me", &vendor2, Value::Null)
@@ -906,4 +919,384 @@ async fn full_order_and_authorization() {
     live_task.abort();
     task.abort();
     db.close().await;
+}
+
+async fn marketplace_workflow(
+    app: &axum::Router,
+    state: &AppState,
+    address: std::net::SocketAddr,
+    [customer, vendor, rider, admin, stranger]: [&str; 5],
+    rider_id: &str,
+) {
+    use futures_util::StreamExt;
+    use tokio_tungstenite::{
+        connect_async,
+        tungstenite::{Message, client::IntoClientRequest},
+    };
+    let mut buffer = std::io::Cursor::new(Vec::new());
+    image::RgbImage::from_pixel(3, 2, image::Rgb([160, 20, 60]))
+        .write_to(&mut buffer, image::ImageFormat::Png)
+        .unwrap();
+    let fields = json!({
+        "name": "Ripe Mangoes", "description":"A vendor listing", "category":"Fruits",
+        "unit":"bag", "price_centavos":24000, "weight_grams":2000
+    });
+    let boundary = "suki-integration-upload";
+    let mut body = format!("--{boundary}\r\nContent-Disposition: form-data; name=\"product\"\r\n\r\n{fields}\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"photo\"; filename=\"../../sample.png\"\r\nContent-Type: image/png\r\n\r\n").into_bytes();
+    body.extend(buffer.into_inner());
+    body.extend(format!("\r\n--{boundary}--\r\n").bytes());
+    let upload = Request::post("/api/vendor/goods")
+        .header("cookie", vendor)
+        .header("x-suki-request", "1")
+        .header(
+            "content-type",
+            format!("multipart/form-data; boundary={boundary}"),
+        )
+        .body(Body::from(body))
+        .unwrap();
+    let response = app.clone().oneshot(upload).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let uploaded: Value =
+        serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    let pid = uploaded["id"].as_i64().unwrap();
+    let (path, grams): (String, i64) =
+        sqlx::query_as("SELECT image,weight_grams FROM products WHERE id=?")
+            .bind(pid)
+            .fetch_one(&state.db)
+            .await
+            .unwrap();
+    assert_eq!(grams, 2000);
+    let photo = app
+        .clone()
+        .oneshot(Request::get(&path).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(photo.headers()["content-type"], "image/jpeg");
+    let bytes = photo.into_body().collect().await.unwrap().to_bytes();
+    let decoded = image::load_from_memory(&bytes).unwrap();
+    assert_eq!((decoded.width(), decoded.height()), (3, 2));
+    assert!(
+        state
+            .media_dir
+            .join(path.strip_prefix("/images/vendor/").unwrap())
+            .is_file()
+    );
+
+    let price_path = format!("/api/vendor/goods/{pid}/price");
+    assert_eq!(
+        call(
+            app,
+            "PATCH",
+            &price_path,
+            stranger,
+            json!({"price_centavos":17000})
+        )
+        .await
+        .0,
+        403
+    );
+    ok(
+        app,
+        "PATCH",
+        &price_path,
+        vendor,
+        json!({"price_centavos":25000}),
+    )
+    .await;
+    ok(
+        app,
+        "PATCH",
+        &format!("/api/vendor/goods/{pid}/availability"),
+        vendor,
+        json!({"available":true}),
+    )
+    .await;
+    let make_quote = |grams| {
+        json!({"address":"123 Synthetic Street, Matina, Davao City",
+        "lat":7.05,"lng":125.59,"weight_grams":grams})
+    };
+    let make_checkout = |quote: Value, payment| {
+        json!({"quote_id":quote["id"],"idempotency_key":id(),
+        "payment_method":payment,"items":[{"product_id":pid,"quantity_milli":2000,"expected_price_centavos":25000}]})
+    };
+    let too_light = ok(
+        app,
+        "POST",
+        "/api/quotes/delivery",
+        customer,
+        make_quote(1000),
+    )
+    .await;
+    assert_eq!(
+        call(
+            app,
+            "POST",
+            "/api/orders",
+            customer,
+            make_checkout(too_light, "cash_on_delivery")
+        )
+        .await
+        .0,
+        409
+    );
+    let quote = ok(
+        app,
+        "POST",
+        "/api/quotes/delivery",
+        customer,
+        make_quote(4000),
+    )
+    .await;
+    assert_eq!(
+        (
+            quote["delivery_fee_centavos"].as_i64(),
+            quote["weight_grams"].as_i64()
+        ),
+        (Some(8500), Some(4000))
+    );
+    let order = ok(
+        app,
+        "POST",
+        "/api/orders",
+        customer,
+        make_checkout(quote, "cash_on_delivery"),
+    )
+    .await;
+    let oid = order["id"].as_str().unwrap();
+    let path = format!("/api/orders/{oid}");
+    let assign = format!("{path}/assign");
+    let status = format!("{path}/status");
+    ok(app, "PUT", &assign, admin, json!({"courier_id":rider_id})).await;
+    assert_eq!(call(app, "GET", &path, vendor, Value::Null).await.0, 403);
+    assert_eq!(
+        call(
+            app,
+            "GET",
+            &format!("{path}/messages"),
+            stranger,
+            Value::Null
+        )
+        .await
+        .0,
+        403
+    );
+    let ws_url = format!("ws://{address}{path}/chat/ws");
+    let connect = |cookie: &str| {
+        let mut request = ws_url.as_str().into_client_request().unwrap();
+        request
+            .headers_mut()
+            .insert("origin", "http://localhost:3000".parse().unwrap());
+        request
+            .headers_mut()
+            .insert("cookie", cookie.parse().unwrap());
+        connect_async(request)
+    };
+    assert!(connect(stranger).await.is_err());
+    let mut sockets = Vec::new();
+    for participant in [customer, vendor, rider] {
+        let (mut socket, _) = connect(participant).await.unwrap();
+        assert!(matches!(
+            tokio::time::timeout(std::time::Duration::from_secs(3), socket.next())
+                .await
+                .unwrap(),
+            Some(Ok(Message::Ping(_)))
+        ));
+        sockets.push(socket);
+    }
+    for (sender, role) in [
+        (vendor, "vendor"),
+        (customer, "customer"),
+        (rider, "courier"),
+    ] {
+        let content = format!("Pickup update from {role}");
+        ok(
+            app,
+            "POST",
+            &format!("{path}/messages"),
+            sender,
+            json!({"content":content}),
+        )
+        .await;
+        for socket in &mut sockets {
+            let response = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+                while let Some(Ok(frame)) = socket.next().await {
+                    if let Message::Text(text) = frame {
+                        return serde_json::from_str::<Value>(&text).unwrap();
+                    }
+                }
+                panic!("Socket closed without broadcasting the order message");
+            })
+            .await
+            .unwrap();
+            assert_eq!(response["message"]["content"], content);
+            assert_eq!(response["message"]["sender_role"], role);
+            assert_eq!(response["message"]["order_id"], oid);
+        }
+    }
+
+    assert_eq!(
+        call(
+            app,
+            "POST",
+            &format!("{path}/payments"),
+            customer,
+            json!({"reference":"COD-CANNOT","amount_centavos":58500})
+        )
+        .await
+        .0,
+        409
+    );
+    ok(app, "PATCH", &status, rider, json!({"status":"shopping"})).await;
+    let detail = ok(app, "GET", &path, rider, Value::Null).await;
+    let line_id = detail["items"][0]["id"].as_str().unwrap();
+    ok(app, "PUT", &format!("{path}/items/{line_id}/purchase"), rider,
+        json!({"actual_quantity_milli":2000,"actual_unit_price_centavos":24500,"unavailable":false})).await;
+    let reconciliation = ok(
+        app,
+        "POST",
+        &format!("{path}/reconcile"),
+        rider,
+        Value::Null,
+    )
+    .await;
+    assert_eq!(reconciliation["final_goods_centavos"], 49000);
+    ok(
+        app,
+        "PATCH",
+        &status,
+        rider,
+        json!({"status":"out_for_delivery"}),
+    )
+    .await;
+    assert_eq!(
+        call(app, "PATCH", &status, rider, json!({"status":"delivered"}))
+            .await
+            .0,
+        409
+    );
+    let collection = format!("{path}/cash-collection");
+    assert_eq!(
+        call(
+            app,
+            "POST",
+            &collection,
+            rider,
+            json!({"amount_centavos":57499})
+        )
+        .await
+        .0,
+        400
+    );
+    ok(
+        app,
+        "POST",
+        &collection,
+        rider,
+        json!({"amount_centavos":57500}),
+    )
+    .await;
+    assert_eq!(
+        call(
+            app,
+            "POST",
+            &collection,
+            rider,
+            json!({"amount_centavos":57500})
+        )
+        .await
+        .0,
+        409
+    );
+    ok(app, "PATCH", &status, rider, json!({"status":"delivered"})).await;
+    assert_eq!(
+        call(app, "PATCH", &status, rider, json!({"status":"completed"}))
+            .await
+            .0,
+        409
+    );
+    ok(
+        app,
+        "POST",
+        &format!("{path}/vendor-settlement"),
+        rider,
+        json!({"reference":"VENDOR-COD-001"}),
+    )
+    .await;
+    ok(app, "PATCH", &status, rider, json!({"status":"completed"})).await;
+    let delivered = ok(app, "GET", &path, customer, Value::Null).await;
+    assert_eq!(delivered["settlement"]["amount_centavos"], 49000);
+    assert_eq!(delivered["payments"][0]["received_amount_centavos"], 57500);
+
+    ok(
+        app,
+        "PUT",
+        "/api/vendor/payment-profile",
+        vendor,
+        json!({"gcash_number":"09123456789"}),
+    )
+    .await;
+    let quote = ok(
+        app,
+        "POST",
+        "/api/quotes/delivery",
+        customer,
+        make_quote(4000),
+    )
+    .await;
+    let direct = ok(
+        app,
+        "POST",
+        "/api/orders",
+        customer,
+        make_checkout(quote, "gcash"),
+    )
+    .await;
+    let direct = format!("/api/orders/{}", direct["id"].as_str().unwrap());
+    let detail = ok(app, "GET", &direct, customer, Value::Null).await;
+    assert_eq!(detail["order"]["gcash_number"], "09123456789");
+    ok(
+        app,
+        "PUT",
+        &format!("{direct}/assign"),
+        admin,
+        json!({"courier_id":rider_id}),
+    )
+    .await;
+    let reference = format!("GCASH-{}", id());
+    let evidence = ok(
+        app,
+        "POST",
+        &format!("{direct}/payments"),
+        customer,
+        json!({"reference":reference,"amount_centavos":58500}),
+    )
+    .await;
+    let queue = ok(
+        app,
+        "GET",
+        "/api/admin/payments/pending",
+        admin,
+        Value::Null,
+    )
+    .await;
+    assert!(
+        queue
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|p| p["id"] == evidence["id"])
+    );
+    ok(
+        app,
+        "POST",
+        &format!("/api/payments/{}/verify", evidence["id"].as_str().unwrap()),
+        rider,
+        json!({"approved":true,"received_amount_centavos":58500}),
+    )
+    .await;
+    assert_eq!(
+        ok(app, "GET", &direct, customer, Value::Null).await["order"]["status"],
+        "paid"
+    );
+    tokio::fs::remove_dir_all(&state.media_dir).await.unwrap();
 }

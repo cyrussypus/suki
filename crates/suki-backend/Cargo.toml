@@ -13,7 +13,7 @@ path = "src/main.rs"
 
 [dependencies]
 suki-shared = { workspace = true, features = ["sqlx"] }
-axum = { version = "0.8.9", features = ["ws"] }
+axum = { version = "0.8.9", features = ["ws", "multipart"] }
 tokio = { version = "1", features = ["full"] }
 sqlx = { version = "0.9.0", default-features = false, features = ["mysql", "runtime-tokio", "tls-rustls", "derive", "migrate", "macros"] }
 serde.workspace = true
@@ -27,6 +27,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 dotenvy = "0.15"
 futures-util = "0.3"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

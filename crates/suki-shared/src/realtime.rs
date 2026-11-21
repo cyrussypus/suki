@@ -5,6 +5,8 @@ use serde::{Deserialize, Serialize};
 pub struct ChatMessage {
     pub id: i64,
     pub sender_id: String,
+    pub order_id: String,
+    pub sender_role: String,
     pub sender_name: String,
     pub content: String,
     pub created_at: i64,
