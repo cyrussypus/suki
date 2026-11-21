@@ -6,6 +6,7 @@ use suki_shared::{
     Acknowledged, StatusResult,
     admin::{AuditEntry, Reports, UserUpdate},
     auth::{Account, Role},
+    crypto::{IntegrityReport, SnapshotVerification, gcash_reference_hash},
     orders::{Assignment, Item, OrderDetail, Purchase, Reconciliation, Status},
     payments::{CashCollection, Payment, RefundReference, Verification},
     pricing::peso,
@@ -40,6 +41,7 @@ pub fn AdminDashboard() -> Element {
                         OrderLink { key: "{order.order_id}", id: order.order_id.clone(), caption: format!("{} collected · {} refunded", peso(order.received_centavos), peso(order.refunds_centavos)) }
                     }
                 }
+                IntegrityInspector { recent_ids: reports.orders.iter().take(30).map(|order| order.order_id.clone()).collect::<Vec<_>>() }
                 details { class: "panel", summary { "Role management" }
                     for account in accounts {
                         ManageUser { key: "{account.id}", account: account.clone(), onsaved: move |_| dashboard.restart() }
@@ -53,6 +55,65 @@ pub fn AdminDashboard() -> Element {
             },
             Some(Err(error)) => rsx! { p { role: "alert", "{error}" } },
             None => rsx! { p { "Loading dashboard…" } },
+        }
+    }
+}
+
+#[component]
+fn IntegrityInspector(recent_ids: Vec<String>) -> Element {
+    let api = use_context::<Api>();
+    let mut order = use_signal(String::new);
+    let mut result = use_signal(|| None::<Result<IntegrityReport, crate::api::Failure>>);
+    let mut busy = use_signal(|| false);
+    rsx! {
+        section { class: "panel",
+            h2 { "Order integrity inspector" }
+            form { onsubmit: move |event| {
+                event.prevent_default();
+                let id = order().trim().to_owned();
+                if busy() || id.len() != 36 || !id.bytes().all(|c| c.is_ascii_hexdigit() || c == b'-') { return; }
+                busy.set(true);
+                result.set(None);
+                let api = api.clone();
+                spawn(async move {
+                    result.set(Some(api.get(&format!("/admin/orders/{id}/integrity")).await));
+                    busy.set(false);
+                });
+            },
+                label { "Order ID" input { required: true, list: "integrity-order-options", pattern: "[0-9a-fA-F\\-]{{36}}", value: "{order}", oninput: move |e| order.set(e.value()) } }
+                datalist { id: "integrity-order-options",
+                    for id in &recent_ids { option { key: "{id}", value: "{id}" } }
+                }
+                button { disabled: busy(), "Verify order integrity" }
+            }
+            match result.read().as_ref() {
+                Some(Ok(report)) => rsx! {
+                    p { "Order " code { "{report.order_id}" } }
+                    p { role: "status", "{report.transactions_verified} transaction entries and {report.messages_verified} chat messages verified. {report.legacy_messages} older messages have no signature." }
+                    match report.snapshot {
+                        SnapshotVerification::Verified => rsx! { p { "Checkout receipt signature verified." } },
+                        SnapshotVerification::Legacy => rsx! { p { "This order predates signed checkout receipts." } },
+                        SnapshotVerification::Invalid => rsx! { p { role: "alert", "Checkout receipt failed verification." } },
+                    }
+                    if report.transactions_verified == 0 && report.first_invalid_transaction.is_none() {
+                        p { "This order has no signed transaction entries." }
+                    }
+                    if let Some(id) = report.first_invalid_transaction {
+                        p { role: "alert", "Transaction entry {id} failed verification." }
+                    }
+                    if let Some(id) = report.first_invalid_message {
+                        p { role: "alert", "Chat message {id} failed verification." }
+                    }
+                    for entry in &report.recent {
+                        p { key: "{entry.id}", "#{entry.id} · {entry.event} · "
+                            if let Some(tag) = &entry.tag { code { "{tag}" } } else { "Unsigned" }
+                        }
+                    }
+                },
+                Some(Err(error)) => rsx! { p { role: "alert", "{error}" } },
+                None if busy() => rsx! { p { role: "status", "Checking order integrity…" } },
+                None => rsx! {},
+            }
         }
     }
 }
@@ -123,8 +184,17 @@ fn VerifyPayment(payment: Payment, onsaved: EventHandler<()>) -> Element {
     let order = payment.order_id.clone();
     let reference = payment.reference.clone();
     let amount = payment.claimed_amount_centavos;
+    let reference_valid =
+        payment.reference_hash.as_deref() == Some(&gcash_reference_hash(&reference));
+    let reference_display = match (reference_valid, &payment.reference_hash) {
+        (true, Some(hash)) => format!("Reference fingerprint: {hash}"),
+        (false, Some(_)) => {
+            "Reference fingerprint mismatch. Review the order integrity report.".into()
+        }
+        _ => "Reference fingerprint unavailable.".into(),
+    };
     let mut submit = move |approved: bool| {
-        if busy() {
+        if busy() || !reference_valid {
             return;
         }
         let expected = if approved {
@@ -164,10 +234,11 @@ fn VerifyPayment(payment: Payment, onsaved: EventHandler<()>) -> Element {
     rsx! {
         article { class: "order-link",
             OrderLink { id: order, caption: format!("{reference} · {}", peso(amount)) }
+            p { "{reference_display}" }
             label { "Amount received (centavos)" input { r#type: "number", min: "0", value: "{received}", oninput: move |e| received.set(e.value()) } }
             div { class: "actions",
-                button { disabled: busy(), onclick: move |_| submit(true), "Verify payment" }
-                button { disabled: busy(), onclick: move |_| reject(false), "Reject unpaid reference" }
+                button { disabled: busy() || !reference_valid, onclick: move |_| submit(true), "Verify payment" }
+                button { disabled: busy() || !reference_valid, onclick: move |_| reject(false), "Reject unpaid reference" }
             }
             if !error().is_empty() { p { role: "alert", "{error}" } }
         }

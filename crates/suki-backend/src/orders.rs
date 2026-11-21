@@ -9,6 +9,7 @@ use suki_shared::{
     delivery::{grams_rounded_up, line_weight_milligrams},
     orders::{CheckoutResult, OrderDetail, PurchaseResult, Reconciliation},
     payments::{PaymentMethod, VendorSettlement},
+    snapshots::{SnapshotItem, SnapshotPayload, delivery_breakdown},
 };
 pub async fn access(s: &App, u: &User, oid: &str) -> Result<Order> {
     let o: Order = sqlx::query_as("SELECT * FROM orders WHERE id=?")
@@ -40,6 +41,7 @@ pub async fn locked(
         .await?
         .ok_or(ApiError(StatusCode::NOT_FOUND, "Order not found".into()))?;
     authorize(u, &o)?;
+    integrity::check_pending(tx, &o.id).await?;
     Ok(o)
 }
 pub async fn history(
@@ -109,8 +111,14 @@ pub async fn detail(
     .bind(&oid)
     .fetch_optional(&s.db)
     .await?;
+    let mut tx = s.db.begin().await?;
+    let snapshot = snapshots::receipt(&mut tx, &s.integrity_key, &o.id, &o.customer_id)
+        .await?
+        .into_result()?;
+    tx.commit().await?;
     Ok(Json(OrderDetail {
         order: o,
+        snapshot,
         items,
         payments,
         refunds,
@@ -129,6 +137,8 @@ struct Quote {
     lng: f64,
     distance_meters: i64,
     fee_centavos: i64,
+    base_fee_centavos: i64,
+    per_km_centavos: i64,
     expires_at: i64,
     consumed: bool,
     weight_grams: Option<i64>,
@@ -170,9 +180,18 @@ pub async fn create(
                 "Idempotency key was used for different order details",
             ));
         }
+        let receipt = snapshots::receipt(&mut tx, &s.integrity_key, &oid, &u.id).await?;
+        // The order already committed. Report its identity even if its receipt fails verification.
+        let (snapshot, snapshot_invalid) = match receipt {
+            snapshots::ReceiptState::Invalid => (None, true),
+            other => (other.into_result()?, false),
+        };
+        tx.commit().await?;
         return Ok(Json(CheckoutResult {
             id: oid,
             replayed: true,
+            snapshot_invalid,
+            snapshot,
         }));
     }
     let q: Quote = sqlx::query_as("SELECT * FROM delivery_quotes WHERE id=? FOR UPDATE")
@@ -202,7 +221,7 @@ pub async fn create(
             "The operator has not configured GCash payments".into(),
         ));
     }
-    let mut snapshots = Vec::new();
+    let mut lines = Vec::new();
     let mut subtotal = 0i64;
     for line in &v.items {
         if line.quantity_milli <= 0 {
@@ -221,7 +240,22 @@ pub async fn create(
         }
         let value = cost(p.price_centavos, line.quantity_milli)?;
         subtotal += value;
-        snapshots.push((p, line.quantity_milli, value));
+        let line_weight = line_weight_milligrams(p.weight_grams, line.quantity_milli)
+            .ok_or(ApiError::bad("Invalid item weight"))?;
+        lines.push(SnapshotItem {
+            item_id: id(),
+            product_id: p.id,
+            vendor_id: p.vendor_id,
+            vendor_name: p.vendor,
+            name: p.name,
+            unit: p.unit,
+            available_at_checkout: p.available,
+            quantity_milli: line.quantity_milli,
+            unit_weight_grams: p.weight_grams,
+            line_weight_milligrams: line_weight,
+            unit_price_centavos: p.price_centavos,
+            line_total_centavos: value,
+        });
     }
     if !suki_shared::pricing::permits_goods_subtotal(subtotal, settings.minimum_centavos) {
         return Err(ApiError::bad(
@@ -231,17 +265,13 @@ pub async fn create(
     let mut vendor_id = None;
     let mut gcash_number = None;
     if let Some(quoted_grams) = q.weight_grams {
-        let vendor = &snapshots[0].0.vendor_id;
-        if snapshots.iter().any(|(p, _, _)| &p.vendor_id != vendor) {
+        let vendor = &lines[0].vendor_id;
+        if lines.iter().any(|line| &line.vendor_id != vendor) {
             return Err(ApiError::bad(
                 "Each order must contain goods from one vendor stall",
             ));
         }
-        let mut milligrams = 0;
-        for (p, qty, _) in &snapshots {
-            milligrams += line_weight_milligrams(p.weight_grams, *qty)
-                .ok_or(ApiError::bad("Invalid item weight"))?;
-        }
+        let milligrams = lines.iter().map(|line| line.line_weight_milligrams).sum();
         if grams_rounded_up(milligrams) != quoted_grams {
             return Err(ApiError::conflict(
                 "Basket weight changed; request a new delivery quote",
@@ -269,23 +299,57 @@ pub async fn create(
         "awaiting_payment"
     };
     let oid = id();
+    let created_at = now();
+    let delivery = delivery_breakdown(
+        q.id.clone(),
+        q.distance_meters,
+        q.weight_grams,
+        q.base_fee_centavos,
+        q.per_km_centavos,
+    )
+    .filter(|breakdown| breakdown.total_centavos == q.fee_centavos)
+    .ok_or(ApiError::conflict(
+        "Delivery quote could not be verified; request a new quote",
+    ))?;
+    let total = subtotal + delivery.total_centavos;
     sqlx::query("INSERT INTO orders(id,customer_id,status,payment_status,payment_method,vendor_id,gcash_number,weight_grams,address,lat,lng,distance_meters,delivery_fee_centavos,goods_subtotal_centavos,estimated_total_centavos,authorized_goods_centavos,idempotency_key,request_hash,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
         .bind(&oid).bind(&u.id).bind(status).bind(payment_status).bind(v.payment_method.as_str())
-        .bind(vendor_id).bind(gcash_number).bind(q.weight_grams).bind(&q.address).bind(q.lat).bind(q.lng)
-        .bind(q.distance_meters).bind(q.fee_centavos).bind(subtotal).bind(subtotal+q.fee_centavos)
-        .bind(subtotal).bind(&v.idempotency_key).bind(digest).bind(now()).bind(now()).execute(&mut *tx).await?;
-    for (p, qty, value) in snapshots {
-        sqlx::query("INSERT INTO order_items(id,order_id,product_id,vendor_id,name,unit,unit_price_centavos,quantity_milli,estimated_cost_centavos) VALUES (?,?,?,?,?,?,?,?,?)").bind(id()).bind(&oid).bind(p.id).bind(p.vendor_id).bind(p.name).bind(p.unit).bind(p.price_centavos).bind(qty).bind(value).execute(&mut *tx).await?;
+        .bind(&vendor_id).bind(gcash_number).bind(q.weight_grams).bind(&q.address).bind(q.lat).bind(q.lng)
+        .bind(q.distance_meters).bind(q.fee_centavos).bind(subtotal).bind(total)
+        .bind(subtotal).bind(&v.idempotency_key).bind(digest).bind(created_at).bind(created_at).execute(&mut *tx).await?;
+    for line in &lines {
+        sqlx::query("INSERT INTO order_items(id,order_id,product_id,vendor_id,name,unit,unit_price_centavos,quantity_milli,estimated_cost_centavos) VALUES (?,?,?,?,?,?,?,?,?)")
+            .bind(&line.item_id).bind(&oid).bind(line.product_id).bind(&line.vendor_id).bind(&line.name).bind(&line.unit)
+            .bind(line.unit_price_centavos).bind(line.quantity_milli).bind(line.line_total_centavos).execute(&mut *tx).await?;
     }
+    let snapshot = snapshots::store(
+        &mut tx,
+        &s.integrity_key,
+        SnapshotPayload {
+            order_id: oid.clone(),
+            customer_id: u.id.clone(),
+            vendor_id,
+            address: q.address,
+            payment_method: v.payment_method,
+            items: lines,
+            delivery,
+            goods_subtotal_centavos: subtotal,
+            total_centavos: total,
+            created_at,
+        },
+    )
+    .await?;
     sqlx::query("UPDATE delivery_quotes SET consumed=TRUE WHERE id=?")
         .bind(q.id)
         .execute(&mut *tx)
         .await?;
     history(&mut tx, &u, &oid, status).await?;
-    tx.commit().await?;
+    integrity::commit(tx, &s.integrity_key, &oid, &u.id).await?;
     Ok(Json(CheckoutResult {
         id: oid,
         replayed: false,
+        snapshot_invalid: false,
+        snapshot: Some(snapshot),
     }))
 }
 pub async fn assign(
@@ -335,7 +399,7 @@ pub async fn assign(
         json!({"courier_id":v.courier_id}),
     )
     .await?;
-    tx.commit().await?;
+    integrity::commit(tx, &s.integrity_key, &o.id, &u.id).await?;
     Ok(Json(Acknowledged { ok: true }))
 }
 pub fn allowed_transition(from: &str, to: &str) -> bool {
@@ -428,7 +492,7 @@ pub async fn transition(
                 .await?;
         }
     }
-    tx.commit().await?;
+    integrity::commit(tx, &s.integrity_key, &o.id, &u.id).await?;
     let _ = s
         .events
         .send((oid, OrderEvent::Status { status: v.status }));
@@ -488,7 +552,7 @@ pub async fn purchase(
     }
     sqlx::query("UPDATE order_items SET actual_quantity_milli=?,actual_unit_price_centavos=?,actual_cost_centavos=?,unavailable=? WHERE id=? AND order_id=?").bind(v.actual_quantity_milli).bind(v.actual_unit_price_centavos).bind(value).bind(v.unavailable).bind(&iid).bind(&oid).execute(&mut *tx).await?;
     audit(&mut tx,&u.id,"purchase.record",&iid,json!({"quantity_milli":v.actual_quantity_milli,"unit_price_centavos":v.actual_unit_price_centavos,"cost_centavos":value})).await?;
-    tx.commit().await?;
+    integrity::commit(tx, &s.integrity_key, &o.id, &u.id).await?;
     Ok(Json(PurchaseResult {
         cost_centavos: value,
     }))
@@ -570,7 +634,7 @@ pub async fn reconcile(
         json!({"actual_goods_centavos":total}),
     )
     .await?;
-    tx.commit().await?;
+    integrity::commit(tx, &s.integrity_key, &o.id, &u.id).await?;
     Ok(Json(Reconciliation {
         status: status.into(),
         final_goods_centavos: total,
@@ -621,7 +685,7 @@ pub async fn decide_adjustment(
         json!({"approved":v.approved}),
     )
     .await?;
-    tx.commit().await?;
+    integrity::commit(tx, &s.integrity_key, &o.id, &u.id).await?;
     Ok(Json(Acknowledged { ok: true }))
 }
 pub async fn propose_substitution(
@@ -666,7 +730,7 @@ pub async fn propose_substitution(
         json!({"name":v.name,"order_id":oid}),
     )
     .await?;
-    tx.commit().await?;
+    integrity::commit(tx, &s.integrity_key, &o.id, &u.id).await?;
     Ok(Json(Created { id: sid }))
 }
 pub async fn decide_substitution(
@@ -695,7 +759,7 @@ pub async fn decide_substitution(
         json!({"approved":v.approved}),
     )
     .await?;
-    tx.commit().await?;
+    integrity::commit(tx, &s.integrity_key, &o.id, &u.id).await?;
     Ok(Json(Acknowledged { ok: true }))
 }
 pub async fn propose_adjustment(
@@ -734,7 +798,7 @@ pub async fn propose_adjustment(
         json!({"goods_centavos":v.proposed_goods_centavos,"reason":reason}),
     )
     .await?;
-    tx.commit().await?;
+    integrity::commit(tx, &s.integrity_key, &o.id, &u.id).await?;
     Ok(Json(Created { id: aid }))
 }
 

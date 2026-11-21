@@ -6,6 +6,8 @@ pub struct Payment {
     pub id: String,
     pub order_id: String,
     pub reference: String,
+    #[serde(default)]
+    pub reference_hash: Option<String>,
     pub claimed_amount_centavos: i64,
     pub received_amount_centavos: Option<i64>,
     pub status: String,

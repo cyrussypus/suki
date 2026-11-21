@@ -204,15 +204,20 @@ pub fn Basket() -> Element {
                         error.set(String::new());
                         let api = api.clone();
                         spawn(async move {
-                            match api.send::<CheckoutResult, _>(Method::POST, "/orders", &request).await {
+                            match api.send::<CheckoutResult, _>(Method::POST, "/orders/checkout", &request).await {
                                 Ok(result) => {
                                     state.pending.set(None);
                                     state.basket.write().clear();
+                                    let valid = result.snapshot.as_ref().is_some_and(|snapshot| snapshot.valid_digest_for(&result.id));
                                     state.active_order.set(Some(result.id));
-                                    state.notice.set(match request.payment_method {
+                                    state.notice.set(if result.snapshot_invalid {
+                                        "Order already placed. Its checkout receipt failed verification. Contact support before paying."
+                                    } else if !valid {
+                                        "Order placed. Open the order to check its checkout receipt."
+                                    } else { match request.payment_method {
                                         PaymentMethod::Gcash => "Order placed. Open the order to see the vendor's GCash number and submit your reference.",
                                         PaymentMethod::CashOnDelivery => "Order placed. Pay your rider when your order arrives.",
-                                    }.into());
+                                    }}.into());
                                     state.page.set(Page::Orders);
                                 }
                                 Err(failure) => {

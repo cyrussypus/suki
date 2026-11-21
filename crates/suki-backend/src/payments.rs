@@ -71,7 +71,7 @@ pub async fn submit(
         json!({"order_id":oid,"claimed_centavos":v.amount_centavos}),
     )
     .await?;
-    tx.commit().await?;
+    integrity::commit(tx, &s.integrity_key, &o.id, &u.id).await?;
     if o.vendor_id.is_some() {
         let _ = s.events.send((oid, OrderEvent::Resync));
     }
@@ -87,12 +87,12 @@ pub async fn verify(
     Json(v): Json<Verification>,
 ) -> Result<Json<StatusResult>> {
     u.require(&["admin", "courier"])?;
-    let mut tx = s.db.begin().await?;
     let oid: String = sqlx::query_scalar("SELECT order_id FROM payments WHERE id=?")
         .bind(&pid)
-        .fetch_optional(&mut *tx)
+        .fetch_optional(&s.db)
         .await?
         .ok_or(ApiError::bad("Payment not found"))?;
+    let mut tx = s.db.begin().await?;
     let o = orders::locked(&mut tx, &u, &oid).await?;
     if o.is_cod() || u.role == "courier" && o.vendor_id.is_none() {
         return Err(ApiError::forbidden());
@@ -101,6 +101,10 @@ pub async fn verify(
         .bind(&pid)
         .fetch_one(&mut *tx)
         .await?;
+    if p.reference_hash.as_deref() != Some(&suki_shared::crypto::gcash_reference_hash(&p.reference))
+    {
+        return Err(ApiError::conflict("GCash reference integrity check failed"));
+    }
     if p.status != "under_verification" {
         return Err(ApiError::conflict("Payment was already verified"));
     }
@@ -162,7 +166,7 @@ pub async fn verify(
         json!({"approved":v.approved,"received_centavos":v.received_amount_centavos}),
     )
     .await?;
-    tx.commit().await?;
+    integrity::commit(tx, &s.integrity_key, &o.id, &u.id).await?;
     if o.vendor_id.is_some() {
         let _ = s.events.send((oid, OrderEvent::Resync));
     }
@@ -178,12 +182,12 @@ pub async fn refund(
 ) -> Result<Json<Acknowledged>> {
     u.require(&["admin"])?;
     let reference = text(&v.reference, 6, 100)?;
-    let mut tx = s.db.begin().await?;
     let oid: String = sqlx::query_scalar("SELECT order_id FROM refunds WHERE id=?")
         .bind(&rid)
-        .fetch_optional(&mut *tx)
+        .fetch_optional(&s.db)
         .await?
         .ok_or(ApiError::bad("Refund not found"))?;
+    let mut tx = s.db.begin().await?;
     let o = orders::locked(&mut tx, &u, &oid).await?;
     if ![
         "ready_for_delivery",
@@ -224,7 +228,7 @@ pub async fn refund(
         json!({"order_id":oid}),
     )
     .await?;
-    tx.commit().await?;
+    integrity::commit(tx, &s.integrity_key, &o.id, &u.id).await?;
     Ok(Json(Acknowledged { ok: true }))
 }
 
@@ -272,7 +276,7 @@ pub async fn collect_cash(
         json!({"amount_centavos": due}),
     )
     .await?;
-    tx.commit().await?;
+    integrity::commit(tx, &s.integrity_key, &o.id, &u.id).await?;
     let _ = s.events.send((oid, OrderEvent::Resync));
     Ok(Json(Acknowledged { ok: true }))
 }
@@ -311,7 +315,7 @@ pub async fn settle_vendor(
         json!({"amount_centavos":amount}),
     )
     .await?;
-    tx.commit().await?;
+    integrity::commit(tx, &s.integrity_key, &o.id, &u.id).await?;
     let _ = s.events.send((oid, OrderEvent::Resync));
     Ok(Json(Acknowledged { ok: true }))
 }
