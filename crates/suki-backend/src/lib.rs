@@ -32,6 +32,7 @@ use tokio::sync::broadcast;
 #[derive(Clone)]
 pub struct AppState {
     pub db: MySqlPool,
+    pub admin_emails: auth::AdminEmails,
     pub integrity_key: suki_shared::crypto::IntegrityKey,
     pub client: reqwest::Client,
     pub secure_cookies: bool,
@@ -183,7 +184,6 @@ pub fn router(s: App) -> Router {
         )
         .route("/api/quotes/delivery", post(delivery::weighted_quote))
         .route("/api/orders/{id}/chat/ws", get(realtime::websocket))
-        .route("/api/admin/payments/pending", get(payments::pending))
         .route(
             "/api/orders/{id}/cash-collection",
             post(payments::collect_cash),
@@ -246,11 +246,20 @@ pub fn router(s: App) -> Router {
             get(realtime::location).put(realtime::update_location),
         )
         .route("/api/orders/{id}/events", get(realtime::websocket))
-        .route("/api/admin/users", get(admin::users))
-        .route("/api/admin/users/{id}", patch(admin::update_user))
-        .route("/api/admin/reports", get(admin::reports))
-        .route("/api/admin/audit", get(admin::logs))
-        .route("/api/admin/orders/{id}/integrity", get(integrity::inspect))
+        .nest(
+            "/api/admin",
+            Router::new()
+                .route("/users", get(admin::users))
+                .route("/users/{id}", patch(admin::update_user))
+                .route("/reports", get(admin::reports))
+                .route("/audit", get(admin::logs))
+                .route("/orders/{id}/integrity", get(integrity::inspect))
+                .route("/payments/pending", get(payments::pending))
+                .layer(middleware::from_fn_with_state(
+                    s.clone(),
+                    auth::require_admin_auth,
+                )),
+        )
         .route("/api/orders/{id}/expenses", post(admin::expense))
         .layer(DefaultBodyLimit::max(32 * 1024))
         .layer(tower_http::trace::TraceLayer::new_for_http())

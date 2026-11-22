@@ -11,6 +11,15 @@ pub struct Account {
     pub status: String,
 }
 
+/// Authenticated session response. Keep the existing account fields at the top level.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+pub struct SessionAccount {
+    #[serde(flatten)]
+    pub account: Account,
+    #[serde(default)]
+    pub admin_access: bool,
+}
+
 #[derive(Clone, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Registration {

@@ -14,12 +14,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .map_err(|_| "Set SUKI_INTEGRITY_KEY before starting the API")?,
     )
     .map_err(|_| "SUKI_INTEGRITY_KEY must be 32 bytes encoded as 64 hex characters")?;
+    let admin_emails = match std::env::var("ADMIN_EMAILS") {
+        Ok(value) => suki_api::auth::AdminEmails::parse(&value)?,
+        Err(std::env::VarError::NotPresent) => suki_api::auth::AdminEmails::default(),
+        Err(error) => return Err(error.into()),
+    };
     let db = sqlx::mysql::MySqlPoolOptions::new()
         .max_connections(15)
         .connect(&std::env::var("DATABASE_URL")?)
         .await?;
     sqlx::migrate!("./migrations").run(&db).await?;
-    suki_api::auth::bootstrap(&db).await?;
+    suki_api::auth::bootstrap(&db, &admin_emails).await?;
     let origin = std::env::var("APP_ORIGIN").unwrap_or_else(|_| "http://localhost:8080".into());
     let secure_cookies = std::env::var("COOKIE_SECURE")
         .map(|s| s != "false")
@@ -29,6 +34,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let s = Arc::new(AppState {
         db,
+        admin_emails,
         integrity_key,
         client: reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(12))

@@ -6,7 +6,17 @@ Startup applies the versioned migrations before listening. The bootstrap adminis
 
 The API binary is `suki-api`. Its image directory can be configured with `SUKI_IMAGE_DIR`. The optional development preview and the native client use the same API endpoints.
 
+<!-- coderabbit-ai-generated:v1 -->
+
+<!-- coderabbit-ai-generated-section:v1:e8b0d7769c198d15fdc53fefe9563b4594350f6b09129408416b0031115f3fda -->
+
 ## Security and storage
+
+Admin privileges require an active administrator account and an email in the server's comma-separated `ADMIN_EMAILS`. Matching ignores surrounding whitespace and letter case. Set the variable before upgrading: an absent or empty list disables admin access. An unlisted administrator receives HTTP 403 at sign-in and on existing authenticated sessions. An allowlisted email does not grant the admin role. The list is loaded at API startup, so restart each instance after editing it. Keep the list when removing the one-time bootstrap credentials, and include the bootstrap email when creating the first admin.
+
+The client uses the server's `admin_access` flag from `GET /api/auth/me` to show the admin dashboard. The API independently enforces both checks before allowing admin operations.
+
+<!-- /coderabbit-ai-generated:v1 -->
 
 - Argon2id password hashes; bounded password workers; per-identity authentication attempt limits.
 - Random opaque session cookies, HttpOnly, SameSite=Lax, optional development-only insecure mode. Only SHA-256 token hashes are stored. Sessions expire after seven days, logout removes them, and administrative account changes revoke them.

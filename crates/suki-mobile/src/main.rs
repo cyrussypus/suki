@@ -11,7 +11,7 @@ use api::Api;
 use dioxus::prelude::*;
 use suki_shared::{
     admin::Settings,
-    auth::{Account, Role},
+    auth::{Account, Role, SessionAccount},
     catalog::{BasketLine, Favorites, Product},
 };
 
@@ -30,6 +30,7 @@ enum Page {
 struct State {
     page: Signal<Page>,
     account: Signal<Option<Account>>,
+    admin_access: Signal<bool>,
     signing_out: Signal<bool>,
     catalog: Signal<Vec<Product>>,
     categories: Signal<Vec<String>>,
@@ -41,11 +42,19 @@ struct State {
     notice: Signal<String>,
 }
 
-fn home_for(account: &Account) -> Page {
-    if account.has_role(Role::Customer) {
+fn can_open_dashboard(account: &Account, admin_access: bool) -> bool {
+    account.has_role(Role::Vendor)
+        || account.has_role(Role::Rider)
+        || (account.has_role(Role::Admin) && admin_access)
+}
+
+fn home_for(account: &Account, admin_access: bool) -> Page {
+    if can_open_dashboard(account, admin_access) {
+        Page::Dashboard
+    } else if account.has_role(Role::Customer) {
         Page::Market
     } else {
-        Page::Dashboard
+        Page::Account
     }
 }
 
@@ -59,6 +68,7 @@ fn App() -> Element {
     let mut state = State {
         page: use_signal(|| Page::Market),
         account: use_signal(|| None),
+        admin_access: use_signal(|| false),
         signing_out: use_signal(|| false),
         catalog: use_signal(Vec::new),
         categories: use_signal(Vec::new),
@@ -79,9 +89,14 @@ fn App() -> Element {
         let api = api.clone();
         async move {
             refresh_catalog(&api, state).await;
-            if let Ok(account) = api.get::<Account>("/auth/me").await {
+            if let Ok(SessionAccount {
+                account,
+                admin_access,
+            }) = api.get("/auth/me").await
+            {
+                state.admin_access.set(admin_access);
                 if (state.page)() == Page::Market {
-                    state.page.set(home_for(&account));
+                    state.page.set(home_for(&account, admin_access));
                 }
                 state.account.set(Some(account));
             }
@@ -92,6 +107,10 @@ fn App() -> Element {
     let basket_count = state.basket.read().len();
     let account = (state.account)();
     let customer = account.as_ref().is_none_or(|a| a.has_role(Role::Customer));
+    let admin_access = (state.admin_access)();
+    let dashboard = account
+        .as_ref()
+        .is_some_and(|a| can_open_dashboard(a, admin_access));
     let vendor = account.as_ref().is_some_and(|a| a.has_role(Role::Vendor));
     rsx! {
         style { {include_str!("style.css")} }
@@ -129,9 +148,9 @@ fn App() -> Element {
                 Page::Account => rsx! { account::AccountScreen {} },
                 Page::Dashboard => match &account {
                     Some(a) if a.has_role(Role::Vendor) => rsx! { vendor::VendorDashboard { vendor_id: a.id.clone() } },
-                    Some(a) if a.has_role(Role::Admin) => rsx! { staff::AdminDashboard {} },
+                    Some(a) if a.has_role(Role::Admin) && admin_access => rsx! { staff::AdminDashboard {} },
                     Some(a) if a.has_role(Role::Rider) => rsx! { orders::OrderList { messages_only: false } },
-                    _ => rsx! { market::Market { favorites_only: false } },
+                    _ => rsx! { account::AccountScreen {} },
                 },
             }
         }
@@ -140,7 +159,7 @@ fn App() -> Element {
                 button { aria_current: if page == Page::Market { "page" }, onclick: move |_| state.page.set(Page::Market),
                     svg { view_box: "0 0 24 24", path { d: "M3 10h18M5 10v10h14V10M4 10l2-6h12l2 6M9 20v-6h6v6" } } span { "Market" }
                 }
-            } else {
+            } else if dashboard {
                 button { aria_current: if page == Page::Dashboard { "page" }, onclick: move |_| state.page.set(Page::Dashboard),
                     svg { view_box: "0 0 24 24", path { d: "M4 4h7v7H4zM13 4h7v7h-7zM4 13h7v7H4zM13 13h7v7h-7z" } } span { "Dashboard" }
                 }

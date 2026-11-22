@@ -115,8 +115,14 @@ async fn full_order_and_authorization() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let task = tokio::spawn(async { axum::serve(listener, fixture).await.unwrap() });
+    let admin_email = format!("{}@test.invalid", id());
     let s: App = Arc::new(AppState {
         db: db.clone(),
+        admin_emails: suki_api::auth::AdminEmails::parse(&format!(
+            "  {}  , second@test.invalid",
+            admin_email.to_uppercase()
+        ))
+        .unwrap(),
         integrity_key: suki_shared::crypto::IntegrityKey::from_hex(&"12".repeat(32)).unwrap(),
         client: reqwest::Client::new(),
         secure_cookies: false,
@@ -132,7 +138,6 @@ async fn full_order_and_authorization() {
     let phc = suki_api::auth::password_hash("Synthetic-test-password-42".into())
         .await
         .unwrap();
-    let admin_email = format!("{}@test.invalid", id());
     sqlx::query("INSERT INTO users VALUES (?,?,?,'',?,'admin','active',?)")
         .bind(&uid)
         .bind("Test Admin")
@@ -302,10 +307,66 @@ async fn full_order_and_authorization() {
     let (courier_id, courier_email) = account(&app, "customer").await;
     activate(&app, &admin, &courier_id, "courier").await;
     let courier = login(&app, &courier_email).await;
+    let blocked_admin = suki_api::router(Arc::new(AppState {
+        admin_emails: suki_api::auth::AdminEmails::parse(&format!(
+            "{customer_email},{vendor_email},{courier_email}"
+        ))
+        .unwrap(),
+        ..(*s).clone()
+    }));
+    for path in [
+        "/api/admin/users",
+        "/api/admin/reports",
+        "/api/admin/audit",
+        "/api/admin/orders/not-an-order/integrity",
+        "/api/admin/payments/pending",
+    ] {
+        assert_eq!(call(&app, "GET", path, "", Value::Null).await.0, 401);
+        for cookie in [&customer, &vendor, &courier, &admin] {
+            assert_eq!(
+                call(&blocked_admin, "GET", path, cookie, Value::Null)
+                    .await
+                    .0,
+                403
+            );
+        }
+    }
+    assert_eq!(
+        call(&blocked_admin, "PUT", "/api/settings", &admin, Value::Null)
+            .await
+            .0,
+        403
+    );
+    assert_eq!(
+        call(&blocked_admin, "GET", "/api/auth/me", &admin, Value::Null)
+            .await
+            .0,
+        403
+    );
+    let (status, _, cookie) = call(
+        &blocked_admin,
+        "POST",
+        "/api/auth/login",
+        "",
+        json!({"email":admin_email,"password":"Synthetic-test-password-42"}),
+    )
+    .await;
+    assert_eq!(status, 403);
+    assert!(cookie.is_empty());
+    assert_eq!(
+        ok(&app, "GET", "/api/auth/me", &admin, Value::Null).await["admin_access"],
+        true
+    );
+    assert_eq!(
+        ok(&app, "GET", "/api/auth/me", &customer, Value::Null).await["admin_access"],
+        false
+    );
+
     let mut settings = ok(&app, "GET", "/api/settings", "", Value::Null).await;
     settings["gcash_qr_url"] = json!("/images/synthetic-test-qr.png");
     ok(&app, "PUT", "/api/settings", &admin, settings).await;
     let unavailable: App = Arc::new(AppState {
+        admin_emails: s.admin_emails.clone(),
         db: db.clone(),
         integrity_key: s.integrity_key.clone(),
         client: reqwest::Client::new(),

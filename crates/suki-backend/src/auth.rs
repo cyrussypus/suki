@@ -4,17 +4,59 @@ use argon2::{
     password_hash::{PasswordHasher, PasswordVerifier, phc::PasswordHash},
 };
 use axum::{
-    extract::{FromRequestParts, State},
+    extract::{FromRequestParts, Request, State},
     http::{HeaderMap, header::SET_COOKIE, request::Parts},
+    middleware::Next,
 };
 pub use suki_shared::auth::{Account, Login, Registration};
 
 use suki_shared::auth::{
     ARGON2_ITERATIONS, ARGON2_LANES, ARGON2_MEMORY_KIB, PASSWORD_MAX_BYTES, PASSWORD_MIN_BYTES,
-    RegistrationResult, SESSION_COOKIE, SESSION_SECONDS, SessionToken,
+    RegistrationResult, Role, SESSION_COOKIE, SESSION_SECONDS, SessionAccount, SessionToken,
 };
 
+#[derive(Clone, Default)]
+pub struct AdminEmails(std::collections::HashSet<String>);
+
+impl AdminEmails {
+    pub fn parse(value: &str) -> std::result::Result<Self, &'static str> {
+        value
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| {
+                email(s).map_err(|_| "ADMIN_EMAILS must contain comma-separated email addresses")
+            })
+            .collect::<std::result::Result<_, _>>()
+            .map(Self)
+    }
+
+    fn contains(&self, address: &str) -> bool {
+        self.0.contains(&address.trim().to_lowercase())
+    }
+
+    fn check(&self, role: &str, address: &str) -> Result<()> {
+        if role == Role::Admin.as_str() && !self.contains(address) {
+            return Err(ApiError::forbidden());
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone)]
 pub struct User(Account);
+
+pub async fn require_admin_auth(
+    State(s): State<App>,
+    mut request: Request,
+    next: Next,
+) -> Result<Response> {
+    // authenticate checks the allowlist against the session owner's stored email.
+    let user = authenticate(&s, request.headers()).await?;
+    user.require(&[Role::Admin.as_str()])?;
+    request.extensions_mut().insert(user);
+    Ok(next.run(request).await)
+}
 
 impl std::ops::Deref for User {
     type Target = Account;
@@ -36,6 +78,9 @@ impl User {
 impl FromRequestParts<App> for User {
     type Rejection = ApiError;
     async fn from_request_parts(parts: &mut Parts, s: &App) -> Result<Self> {
+        if let Some(user) = parts.extensions.get::<User>() {
+            return Ok(user.clone());
+        }
         authenticate(s, &parts.headers).await
     }
 }
@@ -50,7 +95,9 @@ pub fn session_token(h: &HeaderMap) -> Option<SessionToken> {
 pub async fn authenticate(s: &App, h: &HeaderMap) -> Result<User> {
     let token =
         session_token(h).ok_or(ApiError(StatusCode::UNAUTHORIZED, "Please sign in".into()))?;
-    sqlx::query_as::<_,Account>("SELECT u.id,u.name,u.email,u.phone,u.role,u.status FROM users u JOIN sessions s ON s.user_id=u.id WHERE s.token_hash=? AND s.expires_at>? AND u.status='active'").bind(hash(token.secret())).bind(now()).fetch_optional(&s.db).await?.map(User).ok_or(ApiError(StatusCode::UNAUTHORIZED,"Session expired or account unavailable".into()))
+    let account = sqlx::query_as::<_,Account>("SELECT u.id,u.name,u.email,u.phone,u.role,u.status FROM users u JOIN sessions s ON s.user_id=u.id WHERE s.token_hash=? AND s.expires_at>? AND u.status='active'").bind(hash(token.secret())).bind(now()).fetch_optional(&s.db).await?.ok_or(ApiError(StatusCode::UNAUTHORIZED,"Session expired or account unavailable".into()))?;
+    s.admin_emails.check(&account.role, &account.email)?;
+    Ok(User(account))
 }
 fn email(s: &str) -> Result<String> {
     let s = text(s, 5, 190)?.to_lowercase();
@@ -144,8 +191,8 @@ pub async fn login(State(s): State<App>, Json(input): Json<Login>) -> Result<imp
     text(&input.password, 1, PASSWORD_MAX_BYTES)?;
     let key = hash(&email);
     throttle(&s, &key).await?;
-    let row: Option<(String, String, String)> =
-        sqlx::query_as("SELECT id,password_hash,status FROM users WHERE email=?")
+    let row: Option<(String, String, String, String, String)> =
+        sqlx::query_as("SELECT id,password_hash,status,role,email FROM users WHERE email=?")
             .bind(email)
             .fetch_optional(&s.db)
             .await?;
@@ -177,7 +224,7 @@ pub async fn login(State(s): State<App>, Json(input): Json<Login>) -> Result<imp
     })
     .await
     .unwrap_or(false);
-    let Some((uid, _, status)) = row.filter(|_| valid) else {
+    let Some((uid, _, status, role, stored_email)) = row.filter(|_| valid) else {
         return Err(ApiError(
             StatusCode::UNAUTHORIZED,
             "Invalid email or password".into(),
@@ -189,6 +236,7 @@ pub async fn login(State(s): State<App>, Json(input): Json<Login>) -> Result<imp
             "Account is pending approval or inactive".into(),
         ));
     }
+    s.admin_emails.check(&role, &stored_email)?;
     let token = SessionToken::new(format!("{}{}", id(), id()));
     sqlx::query("INSERT INTO sessions VALUES (?,?,?)")
         .bind(hash(token.secret()))
@@ -222,15 +270,25 @@ pub async fn logout(State(s): State<App>, headers: HeaderMap) -> Result<impl Int
         Json(Acknowledged { ok: true }),
     ))
 }
-pub async fn me(user: User) -> Json<Account> {
-    Json(user.0)
+pub async fn me(user: User) -> Json<SessionAccount> {
+    Json(SessionAccount {
+        admin_access: user.has_role(Role::Admin),
+        account: user.0,
+    })
 }
-pub async fn bootstrap(db: &MySqlPool) -> std::result::Result<(), Box<dyn std::error::Error>> {
-    if let Ok(email) = std::env::var("BOOTSTRAP_ADMIN_EMAIL") {
+pub async fn bootstrap(
+    db: &MySqlPool,
+    admin_emails: &AdminEmails,
+) -> std::result::Result<(), Box<dyn std::error::Error>> {
+    if let Ok(address) = std::env::var("BOOTSTRAP_ADMIN_EMAIL") {
         let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE role='admin'")
             .fetch_one(db)
             .await?;
         if count == 0 {
+            let address = email(&address).map_err(|_| "Invalid BOOTSTRAP_ADMIN_EMAIL")?;
+            if !admin_emails.contains(&address) {
+                return Err("BOOTSTRAP_ADMIN_EMAIL must be included in ADMIN_EMAILS".into());
+            }
             let pass = std::env::var("BOOTSTRAP_ADMIN_PASSWORD")?;
             text(&pass, 16, 128)
                 .map_err(|_| "Bootstrap admin password must be at least 16 characters")?;
@@ -240,7 +298,7 @@ pub async fn bootstrap(db: &MySqlPool) -> std::result::Result<(), Box<dyn std::e
             sqlx::query("INSERT INTO users VALUES (?,?,?,?,?,'admin','active',?)")
                 .bind(id())
                 .bind("Suki Administrator")
-                .bind(email.to_lowercase())
+                .bind(address)
                 .bind("")
                 .bind(phc)
                 .bind(now())

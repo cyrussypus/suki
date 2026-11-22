@@ -4,7 +4,7 @@ use dioxus::prelude::*;
 use reqwest::Method;
 use suki_shared::{
     Acknowledged,
-    auth::{Account, Login, Registration, RegistrationResult, Role},
+    auth::{Account, Login, Registration, RegistrationResult, Role, SessionAccount},
 };
 
 #[component]
@@ -34,7 +34,7 @@ pub fn AccountScreen() -> Element {
                         button { onclick: move |_| { state.active_order.set(None); state.page.set(Page::Orders); }, span { class: "menu-icon", "▤" } span { strong { "My orders" } small { "Follow your market finds" } } b { "›" } }
                         button { onclick: move |_| state.page.set(Page::Favorites), span { class: "menu-icon", "♡" } span { strong { "Saved favorites" } small { "Find the things you love" } } b { "›" } }
                         button { onclick: move |_| state.page.set(Page::Basket), span { class: "menu-icon", "▱" } span { strong { "Your basket" } small { "Review your fresh picks" } } b { "›" } }
-                    } else {
+                    } else if crate::can_open_dashboard(&account, (state.admin_access)()) {
                         button { onclick: move |_| state.page.set(Page::Dashboard), span { class: "menu-icon", "▦" } span { strong { "Dashboard" } small { "View your workspace" } } b { "›" } }
                     }
                 }
@@ -58,6 +58,7 @@ pub fn AccountScreen() -> Element {
                             }
                         };
                         if revoked {
+                            state.admin_access.set(false);
                             state.account.set(None);
                             state.basket.write().clear();
                             state.favorites.write().clear();
@@ -101,9 +102,10 @@ pub fn AccountScreen() -> Element {
                                 register.set(false);
                             }
                             api.send::<Acknowledged, _>(Method::POST, "/auth/login", &login).await?;
-                            let account: Account = api.get("/auth/me").await?;
+                            let SessionAccount { account, admin_access } = api.get("/auth/me").await?;
+                            state.admin_access.set(admin_access);
                             state.notice.set(format!("Welcome, {}.", account.name));
-                            state.page.set(crate::home_for(&account));
+                            state.page.set(crate::home_for(&account, admin_access));
                             state.account.set(Some(account));
                             password.set(String::new());
                             Ok(())
