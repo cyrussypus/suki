@@ -21,6 +21,7 @@ enum Page {
     Favorites,
     Basket,
     Orders,
+    Messages,
     Account,
     Dashboard,
 }
@@ -89,16 +90,19 @@ fn App() -> Element {
     let page = (state.page)();
     let active = (state.active_order)();
     let basket_count = state.basket.read().len();
-    let signed_in = state.account.read().is_some();
     let account = (state.account)();
     let customer = account.as_ref().is_none_or(|a| a.has_role(Role::Customer));
     let vendor = account.as_ref().is_some_and(|a| a.has_role(Role::Vendor));
     rsx! {
         style { {include_str!("style.css")} }
         header {
-            div { class: "brand", span { "S" } div { strong { "Suki" } small { "DAVAO CITY MARKET" } } }
-            button { class: "quiet", onclick: move |_| state.page.set(Page::Account),
-                if signed_in { "Account" } else { "Sign in" }
+            div { class: "brand", span { "s" } div { strong { "suki" } small { "YOUR DAVAO MARKET" } } }
+            if customer {
+                button { class: "basket-shortcut", aria_label: "Open basket, {basket_count} items", onclick: move |_| state.page.set(Page::Basket),
+                    svg { view_box: "0 0 24 24", path { d: "M4 9h16l-1 11H5L4 9zM8 9V7a4 4 0 0 1 8 0v2" } } " Basket" if basket_count > 0 { b { "{basket_count}" } }
+                }
+            } else {
+                button { class: "quiet", onclick: move |_| state.page.set(Page::Account), "Account" }
             }
         }
         main {
@@ -115,29 +119,42 @@ fn App() -> Element {
                 Page::Orders => if let Some(id) = active {
                     rsx! { orders::OrderScreen { key: "{id}", id } }
                 } else {
-                    rsx! { orders::OrderList {} }
+                    rsx! { orders::OrderList { messages_only: false } }
+                },
+                Page::Messages => if let Some(id) = active {
+                    rsx! { orders::OrderScreen { key: "{id}", id } }
+                } else {
+                    rsx! { orders::OrderList { messages_only: true } }
                 },
                 Page::Account => rsx! { account::AccountScreen {} },
                 Page::Dashboard => match &account {
                     Some(a) if a.has_role(Role::Vendor) => rsx! { vendor::VendorDashboard { vendor_id: a.id.clone() } },
                     Some(a) if a.has_role(Role::Admin) => rsx! { staff::AdminDashboard {} },
-                    Some(a) if a.has_role(Role::Rider) => rsx! { orders::OrderList {} },
+                    Some(a) if a.has_role(Role::Rider) => rsx! { orders::OrderList { messages_only: false } },
                     _ => rsx! { market::Market { favorites_only: false } },
                 },
             }
         }
         nav { aria_label: "Main navigation",
             if customer {
-                button { aria_current: if page == Page::Market { "page" }, onclick: move |_| state.page.set(Page::Market), "Market" }
-                button { aria_current: if page == Page::Favorites { "page" }, onclick: move |_| state.page.set(Page::Favorites), "Favorites" }
-                button { aria_current: if page == Page::Basket { "page" }, onclick: move |_| state.page.set(Page::Basket), "Basket ({basket_count})" }
+                button { aria_current: if page == Page::Market { "page" }, onclick: move |_| state.page.set(Page::Market),
+                    svg { view_box: "0 0 24 24", path { d: "M3 10h18M5 10v10h14V10M4 10l2-6h12l2 6M9 20v-6h6v6" } } span { "Market" }
+                }
             } else {
-                button { aria_current: if page == Page::Dashboard { "page" }, onclick: move |_| state.page.set(Page::Dashboard), "Dashboard" }
+                button { aria_current: if page == Page::Dashboard { "page" }, onclick: move |_| state.page.set(Page::Dashboard),
+                    svg { view_box: "0 0 24 24", path { d: "M4 4h7v7H4zM13 4h7v7h-7zM4 13h7v7H4zM13 13h7v7h-7z" } } span { "Dashboard" }
+                }
             }
             if !vendor {
+                button { aria_current: if page == Page::Messages { "page" }, onclick: move |_| {
+                    state.active_order.set(None); state.page.set(Page::Messages);
+                }, svg { view_box: "0 0 24 24", path { d: "M20 11.5a8 8 0 0 1-8 8 8.5 8.5 0 0 1-3.5-.7L4 20l1.2-4A8 8 0 1 1 20 11.5zM8 11.5h.01M12 11.5h.01M16 11.5h.01" } } span { "Messages" } }
                 button { aria_current: if page == Page::Orders { "page" }, onclick: move |_| {
                     state.active_order.set(None); state.page.set(Page::Orders);
-                }, "Orders" }
+                }, svg { view_box: "0 0 24 24", path { d: "M6 4h12v16H6zM9 8h6M9 12h6M9 16h4" } } span { "Orders" } }
+            }
+            button { aria_current: if page == Page::Account { "page" }, onclick: move |_| state.page.set(Page::Account),
+                svg { view_box: "0 0 24 24", path { d: "M12 12a4 4 0 1 0 0-8 4 4 0 0 0 0 8zM4.5 20a7.5 7.5 0 0 1 15 0" } } span { "Account" }
             }
         }
     }
