@@ -4,11 +4,14 @@ pub mod auth;
 pub mod catalog;
 pub mod delivery;
 pub mod integrity;
+pub mod limits;
 pub mod media;
 pub mod orders;
 pub mod payments;
 pub mod realtime;
+pub mod reviews;
 pub mod snapshots;
+pub mod storage;
 pub mod vendors;
 
 use axum::{
@@ -32,6 +35,8 @@ use tokio::sync::broadcast;
 #[derive(Clone)]
 pub struct AppState {
     pub db: MySqlPool,
+    pub rate_limits: Arc<limits::RateLimits>,
+    pub admin_emails: auth::AdminEmails,
     pub integrity_key: suki_shared::crypto::IntegrityKey,
     pub client: reqwest::Client,
     pub secure_cookies: bool,
@@ -40,6 +45,7 @@ pub struct AppState {
     pub maps_url: String,
     pub legacy_quotes: bool,
     pub media_dir: std::path::PathBuf,
+    pub r2: Option<storage::R2>,
     pub events: broadcast::Sender<(String, OrderEvent)>,
 }
 pub type App = Arc<AppState>;
@@ -183,7 +189,6 @@ pub fn router(s: App) -> Router {
         )
         .route("/api/quotes/delivery", post(delivery::weighted_quote))
         .route("/api/orders/{id}/chat/ws", get(realtime::websocket))
-        .route("/api/admin/payments/pending", get(payments::pending))
         .route(
             "/api/orders/{id}/cash-collection",
             post(payments::collect_cash),
@@ -246,22 +251,46 @@ pub fn router(s: App) -> Router {
             get(realtime::location).put(realtime::update_location),
         )
         .route("/api/orders/{id}/events", get(realtime::websocket))
-        .route("/api/admin/users", get(admin::users))
-        .route("/api/admin/users/{id}", patch(admin::update_user))
-        .route("/api/admin/reports", get(admin::reports))
-        .route("/api/admin/audit", get(admin::logs))
-        .route("/api/admin/orders/{id}/integrity", get(integrity::inspect))
+        .route(
+            "/api/rider/location/stream",
+            get(realtime::tracking_websocket),
+        )
+        .route("/api/orders/{id}/eta", get(realtime::eta))
+        .route("/api/orders/{id}/reviews", get(reviews::list))
+        .route("/api/orders/{id}/reviews/{kind}", post(reviews::submit))
+        .route("/api/reputation/{kind}/{id}", get(reviews::reputation))
+        .nest(
+            "/api/admin",
+            Router::new()
+                .route("/users", get(admin::users))
+                .route("/users/{id}", patch(admin::update_user))
+                .route("/reports", get(admin::reports))
+                .route("/audit", get(admin::logs))
+                .route("/orders/{id}/integrity", get(integrity::inspect))
+                .route("/payments/pending", get(payments::pending))
+                .layer(middleware::from_fn_with_state(
+                    s.clone(),
+                    auth::require_admin_auth,
+                )),
+        )
         .route("/api/orders/{id}/expenses", post(admin::expense))
         .layer(DefaultBodyLimit::max(32 * 1024))
         .layer(tower_http::trace::TraceLayer::new_for_http())
+        .layer(middleware::from_fn_with_state(s.clone(), limits::enforce))
         .layer(middleware::from_fn_with_state(s.clone(), safety))
         .merge(
             Router::new()
+                .route(
+                    "/api/upload/avatar",
+                    get(media::get_avatar).post(media::avatar),
+                )
+                .route("/api/upload/products/{id}", post(media::upload_product))
                 .route("/api/vendor/goods", post(media::create))
                 .route("/api/vendor/goods/{id}", put(media::edit))
                 .layer(DefaultBodyLimit::max(
                     suki_shared::catalog::MAX_PHOTO_BYTES + 16 * 1024,
                 ))
+                .layer(middleware::from_fn_with_state(s.clone(), limits::enforce))
                 .layer(middleware::from_fn_with_state(s.clone(), safety)),
         )
         .route("/images/vendor/{name}", get(media::photo))

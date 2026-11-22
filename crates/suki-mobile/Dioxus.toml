@@ -6,6 +6,7 @@ android_min_sdk_version = 28
 [bundle]
 identifier = "ph.sukidavao.mobile"
 publisher = "Suki Davao"
+icon = ["assets/suki-icon.png"]
 
 [android]
 min_sdk = 28

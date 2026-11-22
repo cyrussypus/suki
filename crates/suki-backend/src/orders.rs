@@ -485,6 +485,10 @@ pub async fn transition(
             .execute(&mut *tx)
             .await?;
         if v.status == "delivered" {
+            if let Some(courier_id) = &o.courier_id {
+                sqlx::query("UPDATE users SET reputation_points=reputation_points+IF((total_deliveries+1) % 10 = 0,25,0),total_deliveries=total_deliveries+1 WHERE id=?")
+                    .bind(courier_id).execute(&mut *tx).await?;
+            }
             sqlx::query("UPDATE orders SET delivered_at=? WHERE id=?")
                 .bind(now())
                 .bind(&oid)

@@ -4,7 +4,7 @@ use dioxus::prelude::*;
 use reqwest::Method;
 use suki_shared::{
     Acknowledged,
-    auth::{Account, Login, Registration, RegistrationResult, Role},
+    auth::{Account, Login, Registration, RegistrationResult, Role, SessionAccount},
 };
 
 #[component]
@@ -20,21 +20,62 @@ pub fn AccountScreen() -> Element {
     let mut phone = use_signal(String::new);
     let mut shop = use_signal(String::new);
     let mut error = use_signal(String::new);
+    let mut avatar = use_signal(|| None::<String>);
+    use_effect({
+        let api = api.clone();
+        move || {
+            let api = api.clone();
+            if (state.account)().is_some() {
+                spawn(async move {
+                    if let Ok(image) = api
+                        .get::<suki_shared::catalog::AvatarImage>("/upload/avatar")
+                        .await
+                    {
+                        avatar.set(image.image);
+                    }
+                });
+            } else {
+                avatar.set(None);
+            }
+        }
+    });
     if let Some(account) = (state.account)() {
+        let avatar_api = api.clone();
         return rsx! {
             section { class: "account-page",
                 p { class: "eyebrow", "GOOD TO SEE YOU" }
                 h1 { "Your account" }
                 div { class: "profile-card",
-                    span { class: "profile-avatar", "✳" }
+                    span { class: "profile-avatar",
+                        if let Some(image) = (avatar)().as_deref().and_then(|path| api.image(path)) { img { src: "{image}", alt: "Profile photo" } } else { "✳" }
+                    }
                     div { h2 { "{account.name}" } p { "{account.email}" } small { "{account.role}" } }
+                }
+                label { class: "avatar-upload", "Change profile photo"
+                    input { r#type: "file", accept: "image/jpeg,image/png,image/webp", disabled: busy(), onchange: move |e| {
+                        let Some(file) = e.files().into_iter().next() else { return; };
+                        if file.size() > suki_shared::catalog::MAX_PHOTO_BYTES as u64 { error.set("Photo exceeds 5 MiB.".into()); return; }
+                        let api = avatar_api.clone();
+                        busy.set(true);
+                        error.set(String::new());
+                        spawn(async move {
+                            match file.read_bytes().await {
+                                Ok(bytes) => match api.upload_avatar(bytes.to_vec()).await {
+                                    Ok(image) => avatar.set(image.image),
+                                    Err(failure) => error.set(failure.to_string()),
+                                },
+                                Err(_) => error.set("Unable to read photo.".into()),
+                            }
+                            busy.set(false);
+                        });
+                    } }
                 }
                 div { class: "account-menu",
                     if account.has_role(Role::Customer) {
                         button { onclick: move |_| { state.active_order.set(None); state.page.set(Page::Orders); }, span { class: "menu-icon", "▤" } span { strong { "My orders" } small { "Follow your market finds" } } b { "›" } }
                         button { onclick: move |_| state.page.set(Page::Favorites), span { class: "menu-icon", "♡" } span { strong { "Saved favorites" } small { "Find the things you love" } } b { "›" } }
                         button { onclick: move |_| state.page.set(Page::Basket), span { class: "menu-icon", "▱" } span { strong { "Your basket" } small { "Review your fresh picks" } } b { "›" } }
-                    } else {
+                    } else if crate::can_open_dashboard(&account, (state.admin_access)()) {
                         button { onclick: move |_| state.page.set(Page::Dashboard), span { class: "menu-icon", "▦" } span { strong { "Dashboard" } small { "View your workspace" } } b { "›" } }
                     }
                 }
@@ -58,6 +99,7 @@ pub fn AccountScreen() -> Element {
                             }
                         };
                         if revoked {
+                            state.admin_access.set(false);
                             state.account.set(None);
                             state.basket.write().clear();
                             state.favorites.write().clear();
@@ -101,9 +143,10 @@ pub fn AccountScreen() -> Element {
                                 register.set(false);
                             }
                             api.send::<Acknowledged, _>(Method::POST, "/auth/login", &login).await?;
-                            let account: Account = api.get("/auth/me").await?;
+                            let SessionAccount { account, admin_access } = api.get("/auth/me").await?;
+                            state.admin_access.set(admin_access);
                             state.notice.set(format!("Welcome, {}.", account.name));
-                            state.page.set(crate::home_for(&account));
+                            state.page.set(crate::home_for(&account, admin_access));
                             state.account.set(Some(account));
                             password.set(String::new());
                             Ok(())

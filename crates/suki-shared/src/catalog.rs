@@ -13,6 +13,8 @@ pub struct Product {
     pub unit: String,
     pub price_centavos: i64,
     pub image: String,
+    #[serde(default)]
+    pub image_url: Option<String>,
     pub available: bool,
     pub updated_at: i64,
     pub weight_grams: i64,
@@ -97,4 +99,9 @@ pub struct UpdatePriceDto {
 #[serde(deny_unknown_fields)]
 pub struct VendorPaymentProfile {
     pub gcash_number: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+pub struct AvatarImage {
+    pub image: Option<String>,
 }

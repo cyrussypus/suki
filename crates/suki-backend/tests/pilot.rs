@@ -17,7 +17,7 @@ async fn call(
     cookie: &str,
     body: Value,
 ) -> (StatusCode, Value, String) {
-    let req = Request::builder()
+    let mut req = Request::builder()
         .method(method)
         .uri(path)
         .header("content-type", "application/json")
@@ -30,6 +30,12 @@ async fn call(
             Body::from(body.to_string())
         })
         .unwrap();
+    static NEXT_IP: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
+    let ip = std::net::Ipv4Addr::from(NEXT_IP.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+    req.extensions_mut()
+        .insert(axum::extract::ConnectInfo(std::net::SocketAddr::from((
+            ip, 1234,
+        ))));
     let response = app.clone().oneshot(req).await.unwrap();
     let status = response.status();
     let cookie = response
@@ -109,14 +115,81 @@ async fn full_order_and_authorization() {
         axum::routing::post(|Json(v): Json<Value>| async move {
             assert_eq!(v["travelMode"], "DRIVE");
             assert!(v.pointer("/destination/location/latLng/latitude").is_some());
-            Json(json!({"routes":[{"distanceMeters":1234}]}))
+            Json(json!({"routes":[{"distanceMeters":1234,"duration":"480s"}]}))
         }),
     );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let task = tokio::spawn(async { axum::serve(listener, fixture).await.unwrap() });
+    // A small S3 wire fixture keeps CI independent of external credentials. An
+    // optional endpoint allows the same flow to run against a local S3 emulator.
+    let objects = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::<
+        String,
+        Vec<u8>,
+    >::new()));
+    let storage_fixture = axum::Router::new().route(
+        "/{bucket}/{*key}",
+        axum::routing::any({
+            let objects = objects.clone();
+            move |axum::extract::Path((_bucket, key)): axum::extract::Path<(String, String)>,
+                  request: Request<Body>| {
+                let objects = objects.clone();
+                async move {
+                    assert!(
+                        request
+                            .headers()
+                            .get("authorization")
+                            .and_then(|v| v.to_str().ok())
+                            .is_some_and(|v| v.starts_with("AWS4-HMAC-SHA256"))
+                    );
+                    if request.method() == "PUT" {
+                        let body = request
+                            .into_body()
+                            .collect()
+                            .await
+                            .unwrap()
+                            .to_bytes()
+                            .to_vec();
+                        objects.lock().await.insert(key, body);
+                        (StatusCode::OK, Vec::new())
+                    } else if request.method() == "GET" {
+                        match objects.lock().await.get(&key).cloned() {
+                            Some(body) => (StatusCode::OK, body),
+                            None => (StatusCode::NOT_FOUND, Vec::new()),
+                        }
+                    } else {
+                        (StatusCode::METHOD_NOT_ALLOWED, Vec::new())
+                    }
+                }
+            }
+        }),
+    );
+    let storage_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let storage_address = storage_listener.local_addr().unwrap();
+    let storage_task = tokio::spawn(async move {
+        axum::serve(storage_listener, storage_fixture)
+            .await
+            .unwrap()
+    });
+    let endpoint =
+        std::env::var("TEST_R2_ENDPOINT").unwrap_or_else(|_| format!("http://{storage_address}"));
+    let r2 = suki_api::storage::R2::new(
+        &endpoint,
+        "emulate-default",
+        &"https://media.example.invalid".parse().unwrap(),
+        "AKIAIOSFODNN7EXAMPLE",
+        "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+    )
+    .unwrap();
+    let admin_email = format!("{}@test.invalid", id());
     let s: App = Arc::new(AppState {
         db: db.clone(),
+        rate_limits: Default::default(),
+        admin_emails: suki_api::auth::AdminEmails::parse(&format!(
+            "  {}  , second@test.invalid",
+            admin_email.to_uppercase()
+        ))
+        .unwrap(),
         integrity_key: suki_shared::crypto::IntegrityKey::from_hex(&"12".repeat(32)).unwrap(),
         client: reqwest::Client::new(),
         secure_cookies: false,
@@ -124,6 +197,7 @@ async fn full_order_and_authorization() {
         maps_key: "synthetic-test-key".into(),
         maps_url: format!("http://{address}/route"),
         legacy_quotes: true,
+        r2: Some(r2),
         media_dir: std::env::temp_dir().join(format!("suki-media-{}", id())),
         events: tokio::sync::broadcast::channel(256).0,
     });
@@ -132,8 +206,7 @@ async fn full_order_and_authorization() {
     let phc = suki_api::auth::password_hash("Synthetic-test-password-42".into())
         .await
         .unwrap();
-    let admin_email = format!("{}@test.invalid", id());
-    sqlx::query("INSERT INTO users VALUES (?,?,?,'',?,'admin','active',?)")
+    sqlx::query("INSERT INTO users (id,name,email,phone,password_hash,role,status,created_at) VALUES (?,?,?,'',?,'admin','active',?)")
         .bind(&uid)
         .bind("Test Admin")
         .bind(&admin_email)
@@ -302,11 +375,307 @@ async fn full_order_and_authorization() {
     let (courier_id, courier_email) = account(&app, "customer").await;
     activate(&app, &admin, &courier_id, "courier").await;
     let courier = login(&app, &courier_email).await;
+    let blocked_admin = suki_api::router(Arc::new(AppState {
+        admin_emails: suki_api::auth::AdminEmails::parse(&format!(
+            "{customer_email},{vendor_email},{courier_email}"
+        ))
+        .unwrap(),
+        ..(*s).clone()
+    }));
+    for path in [
+        "/api/admin/users",
+        "/api/admin/reports",
+        "/api/admin/audit",
+        "/api/admin/orders/not-an-order/integrity",
+        "/api/admin/payments/pending",
+    ] {
+        assert_eq!(call(&app, "GET", path, "", Value::Null).await.0, 401);
+        for cookie in [&customer, &vendor, &courier, &admin] {
+            assert_eq!(
+                call(&blocked_admin, "GET", path, cookie, Value::Null)
+                    .await
+                    .0,
+                403
+            );
+        }
+    }
+    assert_eq!(
+        call(&blocked_admin, "PUT", "/api/settings", &admin, Value::Null)
+            .await
+            .0,
+        403
+    );
+    assert_eq!(
+        call(&blocked_admin, "GET", "/api/auth/me", &admin, Value::Null)
+            .await
+            .0,
+        403
+    );
+    let (status, _, cookie) = call(
+        &blocked_admin,
+        "POST",
+        "/api/auth/login",
+        "",
+        json!({"email":admin_email,"password":"Synthetic-test-password-42"}),
+    )
+    .await;
+    assert_eq!(status, 403);
+    assert!(cookie.is_empty());
+    assert_eq!(
+        ok(&app, "GET", "/api/auth/me", &admin, Value::Null).await["admin_access"],
+        true
+    );
+    assert_eq!(
+        ok(&app, "GET", "/api/auth/me", &customer, Value::Null).await["admin_access"],
+        false
+    );
+
+    // Exercise limits through the middleware, including spoofed proxy headers.
+    let limited = suki_api::router(Arc::new(AppState {
+        rate_limits: Default::default(),
+        ..(*s).clone()
+    }));
+    let limited_call = |route: String, method: &'static str, cookie: String, ip: [u8; 4]| {
+        let app = limited.clone();
+        async move {
+            let mut request = Request::builder()
+                .uri(route)
+                .method(method)
+                .header("cookie", cookie)
+                .header("x-suki-request", "1")
+                .header("x-forwarded-for", "203.0.113.99")
+                .body(Body::empty())
+                .unwrap();
+            request.extensions_mut().insert(axum::extract::ConnectInfo(
+                std::net::SocketAddr::from((ip, 1234)),
+            ));
+            app.oneshot(request).await.unwrap().status()
+        }
+    };
+    for _ in 0..5 {
+        assert_eq!(
+            limited_call("/api/auth/me".into(), "GET", String::new(), [127, 0, 0, 8]).await,
+            StatusCode::UNAUTHORIZED
+        );
+    }
+    assert_eq!(
+        limited_call("/api/auth/me".into(), "GET", String::new(), [127, 0, 0, 8]).await,
+        StatusCode::TOO_MANY_REQUESTS
+    );
+    assert_eq!(
+        limited_call("/api/auth/me".into(), "GET", String::new(), [127, 0, 0, 9]).await,
+        StatusCode::UNAUTHORIZED
+    );
+    for _ in 0..10 {
+        assert_ne!(
+            limited_call(
+                "/api/upload/avatar".into(),
+                "POST",
+                customer.clone(),
+                [127, 0, 0, 8]
+            )
+            .await,
+            StatusCode::TOO_MANY_REQUESTS
+        );
+    }
+    assert_eq!(
+        limited_call(
+            "/api/upload/avatar".into(),
+            "POST",
+            customer.clone(),
+            [127, 0, 0, 8]
+        )
+        .await,
+        StatusCode::TOO_MANY_REQUESTS
+    );
+    let second_customer_session = login(&app, &customer_email).await;
+    assert_eq!(
+        limited_call(
+            "/api/upload/avatar".into(),
+            "POST",
+            second_customer_session,
+            [127, 0, 0, 9]
+        )
+        .await,
+        StatusCode::TOO_MANY_REQUESTS
+    );
+    assert_ne!(
+        limited_call(
+            "/api/upload/avatar".into(),
+            "POST",
+            vendor.clone(),
+            [127, 0, 0, 8]
+        )
+        .await,
+        StatusCode::TOO_MANY_REQUESTS
+    );
+    for _ in 0..120 {
+        assert_ne!(
+            limited_call(
+                "/api/orders/missing/location".into(),
+                "PUT",
+                courier.clone(),
+                [127, 0, 0, 8]
+            )
+            .await,
+            StatusCode::TOO_MANY_REQUESTS
+        );
+    }
+    assert_eq!(
+        limited_call(
+            "/api/orders/missing/location".into(),
+            "PUT",
+            courier.clone(),
+            [127, 0, 0, 8]
+        )
+        .await,
+        StatusCode::TOO_MANY_REQUESTS
+    );
+
+    let second_courier_session = login(&app, &courier_email).await;
+    assert_ne!(
+        limited_call(
+            "/api/orders/missing/location".into(),
+            "PUT",
+            second_courier_session,
+            [127, 0, 0, 8]
+        )
+        .await,
+        StatusCode::TOO_MANY_REQUESTS
+    );
+
+    // Authenticated photo uploads are bound to the session identity and product owner.
+    let upload_photo = |route: String, cookie: String, bytes: Vec<u8>| {
+        let app = app.clone();
+        async move {
+            let boundary = "avatar-fixture";
+            let mut body = format!("--{boundary}\r\nContent-Disposition: form-data; name=\"photo\"; filename=\"photo.png\"\r\nContent-Type: image/png\r\n\r\n").into_bytes();
+            body.extend(bytes);
+            body.extend(format!("\r\n--{boundary}--\r\n").bytes());
+            app.oneshot(
+                Request::post(route)
+                    .header("cookie", cookie)
+                    .header("x-suki-request", "1")
+                    .header(
+                        "content-type",
+                        format!("multipart/form-data; boundary={boundary}"),
+                    )
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+        }
+    };
+    let mut png = std::io::Cursor::new(Vec::new());
+    image::RgbImage::from_pixel(3, 2, image::Rgb([1, 2, 3]))
+        .write_to(&mut png, image::ImageFormat::Png)
+        .unwrap();
+    let png = png.into_inner();
+    for cookie in [&customer, &vendor, &courier] {
+        let response = upload_photo("/api/upload/avatar".into(), cookie.clone(), png.clone()).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let result: Value =
+            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        let path = result["image"].as_str().unwrap();
+        let photo = app
+            .clone()
+            .oneshot(Request::get(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(photo.status(), StatusCode::OK);
+        assert_eq!(photo.headers()["content-type"], "image/jpeg");
+        assert_eq!(
+            ok(&app, "GET", "/api/upload/avatar", cookie, Value::Null).await["image"],
+            path
+        );
+    }
+    for cookie in [&customer, &courier, &vendor2] {
+        let response = upload_photo(
+            format!("/api/upload/products/{pid}"),
+            cookie.clone(),
+            png.clone(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+    let mut webp = std::io::Cursor::new(Vec::new());
+    image::RgbImage::from_pixel(2, 2, image::Rgb([70, 90, 10]))
+        .write_to(&mut webp, image::ImageFormat::WebP)
+        .unwrap();
+    let webp = upload_photo(
+        "/api/upload/avatar".into(),
+        customer.clone(),
+        webp.into_inner(),
+    )
+    .await;
+    assert_eq!(webp.status(), StatusCode::OK);
+    let invalid = upload_photo(
+        "/api/upload/avatar".into(),
+        customer.clone(),
+        b"not an image".to_vec(),
+    )
+    .await;
+    assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
+    let oversized = upload_photo(
+        "/api/upload/avatar".into(),
+        customer.clone(),
+        vec![0; 5 * 1024 * 1024 + 1],
+    )
+    .await;
+    assert_eq!(oversized.status(), StatusCode::BAD_REQUEST);
+    let product_photo = upload_photo(
+        format!("/api/upload/products/{pid}"),
+        vendor.clone(),
+        png.clone(),
+    )
+    .await;
+    assert_eq!(product_photo.status(), StatusCode::OK);
+    let image_url: Option<String> = sqlx::query_scalar("SELECT image_url FROM products WHERE id=?")
+        .bind(pid)
+        .fetch_one(&db)
+        .await
+        .unwrap();
+    assert!(
+        image_url
+            .as_deref()
+            .unwrap()
+            .starts_with("https://media.example.invalid/images/")
+    );
+
+    let listing = ok(&app, "GET", "/api/products", "", Value::Null).await;
+    let listed = listing
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["id"] == pid)
+        .unwrap();
+    assert_eq!(listed["image_url"], image_url.unwrap());
+    let mut update = product(16000);
+    update["image"] = listed["image"].clone();
+    ok(
+        &app,
+        "PUT",
+        &format!("/api/products/{pid}"),
+        &vendor,
+        update,
+    )
+    .await;
+    let kept: Option<String> = sqlx::query_scalar("SELECT image_url FROM products WHERE id=?")
+        .bind(pid)
+        .fetch_one(&db)
+        .await
+        .unwrap();
+    assert!(kept.is_some());
+
     let mut settings = ok(&app, "GET", "/api/settings", "", Value::Null).await;
     settings["gcash_qr_url"] = json!("/images/synthetic-test-qr.png");
     ok(&app, "PUT", "/api/settings", &admin, settings).await;
     let unavailable: App = Arc::new(AppState {
+        admin_emails: s.admin_emails.clone(),
         db: db.clone(),
+        rate_limits: Default::default(),
         integrity_key: s.integrity_key.clone(),
         client: reqwest::Client::new(),
         secure_cookies: false,
@@ -314,6 +683,7 @@ async fn full_order_and_authorization() {
         maps_key: String::new(),
         maps_url: "http://127.0.0.1:1".into(),
         legacy_quotes: true,
+        r2: None,
         media_dir: std::env::temp_dir().join(format!("suki-media-{}", id())),
         events: tokio::sync::broadcast::channel(4).0,
     });
@@ -919,6 +1289,7 @@ async fn full_order_and_authorization() {
             .any(|r| r["action"] == "payment.verify")
     );
     live_task.abort();
+    storage_task.abort();
     task.abort();
     db.close().await;
 }
@@ -930,7 +1301,7 @@ async fn marketplace_workflow(
     [customer, vendor, rider, admin, stranger]: [&str; 5],
     rider_id: &str,
 ) {
-    use futures_util::StreamExt;
+    use futures_util::{SinkExt, StreamExt};
     use tokio_tungstenite::{
         connect_async,
         tungstenite::{Message, client::IntoClientRequest},
@@ -978,11 +1349,21 @@ async fn marketplace_workflow(
     let decoded = image::load_from_memory(&bytes).unwrap();
     assert_eq!((decoded.width(), decoded.height()), (3, 2));
     assert!(
-        state
+        !state
             .media_dir
             .join(path.strip_prefix("/images/vendor/").unwrap())
-            .is_file()
+            .exists()
     );
+    let (image_url, owner, product_id): (String, String, i64) = sqlx::query_as("SELECT m.public_url,m.owner_id,m.product_id FROM media_objects m JOIN products p ON p.image_url=m.public_url WHERE p.id=?")
+        .bind(pid).fetch_one(&state.db).await.unwrap();
+    assert!(image_url.starts_with("https://media.example.invalid/images/"));
+    assert_eq!(product_id, pid);
+    let vendor_id: String = sqlx::query_scalar("SELECT vendor_id FROM products WHERE id=?")
+        .bind(pid)
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
+    assert_eq!(owner, vendor_id);
 
     let price_path = format!("/api/vendor/goods/{pid}/price");
     assert_eq!(
@@ -1306,6 +1687,98 @@ async fn marketplace_workflow(
         json!({"status":"out_for_delivery"}),
     )
     .await;
+    let reviews_path = format!("{path}/reviews");
+    assert_eq!(
+        call(
+            app,
+            "POST",
+            &format!("{reviews_path}/vendor"),
+            customer,
+            json!({"rating":5,"tags":[]})
+        )
+        .await
+        .0,
+        409
+    );
+    let tracking_url = format!("ws://{address}/api/rider/location/stream?order_id={oid}");
+    let track = |cookie: &str| {
+        let mut req = tracking_url.as_str().into_client_request().unwrap();
+        req.headers_mut()
+            .insert("origin", "http://localhost:3000".parse().unwrap());
+        req.headers_mut().insert("cookie", cookie.parse().unwrap());
+        connect_async(req)
+    };
+    assert!(track(stranger).await.is_err());
+    assert!(track(vendor).await.is_err());
+    let (mut forbidden_sender, _) = track(customer).await.unwrap();
+    forbidden_sender
+        .send(Message::Text(
+            json!({"lat":7.05,"lng":125.59,"observed_at":now()})
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while let Some(Ok(frame)) = forbidden_sender.next().await {
+            if matches!(frame, Message::Close(_)) {
+                return;
+            }
+        }
+    })
+    .await
+    .expect("customer cannot publish location");
+    let (mut tracking_customer, _) = track(customer).await.unwrap();
+    let (mut tracking_rider, _) = track(rider).await.unwrap();
+    tracking_rider
+        .send(Message::Text(
+            json!({"lat":7.05,"lng":125.59,"heading":360,"observed_at":now()})
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+    let rejection = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while let Some(Ok(frame)) = tracking_rider.next().await {
+            if let Message::Text(text) = frame {
+                return serde_json::from_str::<Value>(&text).unwrap();
+            }
+        }
+        panic!("Expected invalid telemetry rejection")
+    })
+    .await
+    .unwrap();
+    assert!(rejection["error"].is_string());
+    tracking_rider
+        .send(Message::Text(
+            json!({"lat":7.05,"lng":125.59,"heading":90.0,"speed":8.0,"observed_at":now()})
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+    let telemetry = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while let Some(Ok(frame)) = tracking_customer.next().await {
+            if let Message::Text(text) = frame {
+                return serde_json::from_str::<Value>(&text).unwrap();
+            }
+        }
+        panic!("Tracking stream closed before receiving telemetry")
+    })
+    .await
+    .unwrap();
+    assert_eq!(telemetry["type"], "location");
+    assert_eq!(telemetry["heading"], 90.0);
+    assert_eq!(telemetry["speed"], 8.0);
+    assert_eq!(
+        call(app, "GET", &format!("{path}/eta"), stranger, Value::Null)
+            .await
+            .0,
+        403
+    );
+    let estimate = ok(app, "GET", &format!("{path}/eta"), customer, Value::Null).await;
+    assert_eq!(estimate["distance_meters"], 1234);
+    assert_eq!(estimate["duration_seconds"], 480);
     assert_eq!(
         call(app, "PATCH", &status, rider, json!({"status":"delivered"}))
             .await
@@ -1345,7 +1818,143 @@ async fn marketplace_workflow(
         .0,
         409
     );
+    sqlx::query("UPDATE users SET total_deliveries=9 WHERE id=?")
+        .bind(rider_id)
+        .execute(&state.db)
+        .await
+        .unwrap();
     ok(app, "PATCH", &status, rider, json!({"status":"delivered"})).await;
+    for socket in [&mut tracking_customer, &mut tracking_rider] {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while let Some(Ok(frame)) = socket.next().await {
+                if matches!(frame, Message::Close(_)) {
+                    return;
+                }
+            }
+        })
+        .await
+        .expect("tracking closes on delivery");
+    }
+    assert!(track(customer).await.is_err());
+    assert_eq!(
+        call(app, "GET", &format!("{path}/eta"), customer, Value::Null)
+            .await
+            .0,
+        403
+    );
+    assert_eq!(
+        call(
+            app,
+            "POST",
+            &format!("{reviews_path}/vendor"),
+            rider,
+            json!({"rating":5,"tags":[]})
+        )
+        .await
+        .0,
+        403
+    );
+    assert_eq!(
+        call(
+            app,
+            "POST",
+            &format!("{reviews_path}/vendor"),
+            stranger,
+            json!({"rating":5,"tags":[]})
+        )
+        .await
+        .0,
+        403
+    );
+    assert_eq!(
+        call(
+            app,
+            "POST",
+            &format!("{reviews_path}/vendor"),
+            customer,
+            json!({"rating":0,"tags":[]})
+        )
+        .await
+        .0,
+        400
+    );
+    assert_eq!(
+        call(
+            app,
+            "POST",
+            &format!("{reviews_path}/vendor"),
+            customer,
+            json!({"rating":5,"tags":["speed"]})
+        )
+        .await
+        .0,
+        400
+    );
+    ok(
+        app,
+        "POST",
+        &format!("{reviews_path}/vendor"),
+        customer,
+        json!({"rating":5,"comment":"Fresh", "tags":["quality"]}),
+    )
+    .await;
+    ok(
+        app,
+        "POST",
+        &format!("{reviews_path}/rider"),
+        customer,
+        json!({"rating":4,"tags":["courtesy"]}),
+    )
+    .await;
+    assert_eq!(
+        call(
+            app,
+            "POST",
+            &format!("{reviews_path}/vendor"),
+            customer,
+            json!({"rating":4,"tags":[]})
+        )
+        .await
+        .0,
+        409
+    );
+    assert_eq!(
+        call(
+            app,
+            "POST",
+            &format!("{reviews_path}/rider"),
+            customer,
+            json!({"rating":5,"tags":[]})
+        )
+        .await
+        .0,
+        409
+    );
+    let review = ok(app, "GET", &reviews_path, customer, Value::Null).await;
+    assert_eq!(review["vendor"]["rating"], 5);
+    assert_eq!(review["rider"]["rating"], 4);
+    let vendor_reputation = ok(
+        app,
+        "GET",
+        &format!("/api/reputation/vendor/{vendor_id}"),
+        customer,
+        Value::Null,
+    )
+    .await;
+    assert_eq!(vendor_reputation["score"], "5.00");
+    assert_eq!(vendor_reputation["total_reviews"], 1);
+    assert_eq!(vendor_reputation["reputation_points"], 15);
+    let rider_reputation = ok(
+        app,
+        "GET",
+        &format!("/api/reputation/rider/{rider_id}"),
+        customer,
+        Value::Null,
+    )
+    .await;
+    assert_eq!(rider_reputation["score"], "4.00");
+    assert_eq!(rider_reputation["reputation_points"], 35);
+    assert_eq!(rider_reputation["total_deliveries"], 10);
     assert_eq!(
         call(app, "PATCH", &status, rider, json!({"status":"completed"}))
             .await
@@ -1511,5 +2120,104 @@ async fn marketplace_workflow(
         after["first_invalid_transaction"]
     );
 
-    tokio::fs::remove_dir_all(&state.media_dir).await.unwrap();
+    // A cancelled active delivery must close its separate tracking stream and erase GPS.
+    let quote = ok(
+        app,
+        "POST",
+        "/api/quotes/delivery",
+        customer,
+        make_quote(4000),
+    )
+    .await;
+    let canceled_order = ok(
+        app,
+        "POST",
+        "/api/orders/checkout",
+        customer,
+        make_checkout(quote, "cash_on_delivery"),
+    )
+    .await;
+    let canceled_id = canceled_order["id"].as_str().unwrap();
+    let canceled_path = format!("/api/orders/{canceled_id}");
+    ok(
+        app,
+        "PUT",
+        &format!("{canceled_path}/assign"),
+        admin,
+        json!({"courier_id":rider_id}),
+    )
+    .await;
+    ok(
+        app,
+        "PATCH",
+        &format!("{canceled_path}/status"),
+        rider,
+        json!({"status":"shopping"}),
+    )
+    .await;
+    let detail = ok(app, "GET", &canceled_path, rider, Value::Null).await;
+    let item = &detail["items"][0];
+    ok(app, "PUT", &format!("{canceled_path}/items/{}/purchase", item["id"].as_str().unwrap()), rider,
+        json!({"actual_quantity_milli": item["quantity_milli"], "actual_unit_price_centavos": item["unit_price_centavos"], "unavailable":false})).await;
+    ok(
+        app,
+        "POST",
+        &format!("{canceled_path}/reconcile"),
+        rider,
+        Value::Null,
+    )
+    .await;
+    ok(
+        app,
+        "PATCH",
+        &format!("{canceled_path}/status"),
+        rider,
+        json!({"status":"out_for_delivery"}),
+    )
+    .await;
+    ok(
+        app,
+        "PUT",
+        &format!("{canceled_path}/location"),
+        rider,
+        json!({"lat":7.05,"lng":125.59}),
+    )
+    .await;
+    let cancel_url = format!("ws://{address}/api/rider/location/stream?order_id={canceled_id}");
+    let mut request = cancel_url.as_str().into_client_request().unwrap();
+    request
+        .headers_mut()
+        .insert("origin", "http://localhost:3000".parse().unwrap());
+    request
+        .headers_mut()
+        .insert("cookie", customer.parse().unwrap());
+    let (mut socket, _) = connect_async(request).await.unwrap();
+    ok(
+        app,
+        "PATCH",
+        &format!("{canceled_path}/status"),
+        admin,
+        json!({"status":"canceled"}),
+    )
+    .await;
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while let Some(Ok(frame)) = socket.next().await {
+            if matches!(frame, Message::Close(_)) {
+                return;
+            }
+        }
+    })
+    .await
+    .expect("tracking closes on cancellation");
+    let stored: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM delivery_locations WHERE order_id=?")
+            .bind(canceled_id)
+            .fetch_one(&state.db)
+            .await
+            .unwrap();
+    assert_eq!(stored, 0);
+
+    if state.media_dir.exists() {
+        tokio::fs::remove_dir_all(&state.media_dir).await.unwrap();
+    }
 }

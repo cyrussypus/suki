@@ -228,7 +228,7 @@ fn ProductForm(product: Option<Product>, onclose: EventHandler<()>) -> Element {
                 };
                 let selected = file();
                 if pid.is_none() && selected.is_none() {
-                    error.set("Select a JPEG or PNG photo.".into());
+                    error.set("Select a JPEG, PNG or WebP photo.".into());
                     return;
                 }
                 let body = CreateProductDto { name: name(), description: description(), category: category(), unit: unit(), weight_grams, price_centavos };
@@ -261,7 +261,7 @@ fn ProductForm(product: Option<Product>, onclose: EventHandler<()>) -> Element {
                 label { "Selling unit" input { required: true, maxlength: "30", value: "{unit}", oninput: move |e| unit.set(e.value()) } }
                 label { "Weight per selling unit (grams)" input { r#type: "number", required: true, min: "1", max: "50000", value: "{grams}", oninput: move |e| grams.set(e.value()) } }
                 label { "Price (centavos)" input { r#type: "number", required: true, min: "1", value: "{price}", oninput: move |e| price.set(e.value()) } }
-                label { "Product photo" input { r#type: "file", accept: "image/jpeg,image/png", onchange: move |e| {
+                label { "Product photo" input { r#type: "file", accept: "image/jpeg,image/png,image/webp", onchange: move |e| {
                     let selected = e.files().into_iter().next();
                     if selected.as_ref().is_some_and(|f| f.size() > MAX_PHOTO_BYTES as u64) {
                         file.set(None);

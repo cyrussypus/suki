@@ -47,7 +47,13 @@ Use **Order integrity inspector** on the admin dashboard to inspect a full order
 New checkouts save one signed receipt in `order_snapshots` as part of the order transaction. The receipt locks the listing, vendor, weight, checkout price, payment method and quoted delivery charges. The customer and assigned rider can see this receipt; vendors can see only their own lines. The admin inspector checks the receipt against its signed audit entry. Orders placed before signed receipts were introduced retain their original checkout figures without a signature. The receipt always shows the checkout total. COD collection and vendor settlement continue to use the reconciled amounts displayed separately in the order.
 
 
-The catalog starts empty. Register a vendor account, activate it in the admin dashboard, then sign in as the vendor and upload a product. Set `SUKI_MEDIA_DIR` to a writable, persistent directory and include it in backups.
+<!-- coderabbit-ai-generated:v1 -->
+
+<!-- coderabbit-ai-generated-section:v1:576fed61a34dc010af9a9154e8d67b889af471637aa382e7fc4ecf549775df5b -->
+
+The catalog starts empty. Register a vendor account, activate it in the admin dashboard, then sign in as the vendor and upload a product. Configure the R2 variables in the [backend guide](../crates/suki-backend/README.md) before uploading. Keep `SUKI_MEDIA_DIR` available and backed up for photos stored by earlier releases.
+
+<!-- /coderabbit-ai-generated:v1 -->
 
 
 ## Native mobile builds

@@ -79,7 +79,7 @@ pub async fn update(
     if category == 0 {
         return Err(ApiError::bad("Unknown category"));
     }
-    sqlx::query("UPDATE products SET name=?,local_name=?,description=?,category=?,unit=?,price_centavos=?,image=?,available=?,updated_at=? WHERE id=?").bind(&p.name).bind(&p.local_name).bind(&p.description).bind(&p.category).bind(&p.unit).bind(p.price_centavos).bind(&p.image).bind(p.available).bind(now()).bind(pid).execute(&mut *tx).await?;
+    sqlx::query("UPDATE products SET name=?,local_name=?,description=?,category=?,unit=?,price_centavos=?,image_url=IF(image=?,image_url,NULL),image=?,available=?,updated_at=? WHERE id=?").bind(&p.name).bind(&p.local_name).bind(&p.description).bind(&p.category).bind(&p.unit).bind(p.price_centavos).bind(&p.image).bind(&p.image).bind(p.available).bind(now()).bind(pid).execute(&mut *tx).await?;
     audit(
         &mut tx,
         &u.id,

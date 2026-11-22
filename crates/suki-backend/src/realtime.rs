@@ -133,16 +133,29 @@ pub async fn update_location(
     Path(oid): Path<String>,
     Json(v): Json<Position>,
 ) -> Result<Json<PositionResult>> {
+    store_location(&s, &u, &oid, v).await.map(Json)
+}
+
+async fn store_location(s: &App, u: &User, oid: &str, v: Position) -> Result<PositionResult> {
     coordinates(v.lat, v.lng)?;
+    if v.heading
+        .is_some_and(|h| !h.is_finite() || !(0.0..360.0).contains(&h))
+        || v.speed
+            .is_some_and(|speed| !speed.is_finite() || !(0.0..=150.0).contains(&speed))
+        || v.observed_at
+            .is_some_and(|t| t < now() - 30 || t > now() + 5)
+    {
+        return Err(ApiError::bad("Invalid or stale location telemetry"));
+    }
     u.require(&["courier", "admin"])?;
     let mut tx = s.db.begin().await?;
-    let o = orders::locked(&mut tx, &u, &oid).await?;
+    let o = orders::locked(&mut tx, u, oid).await?;
     if o.status != "out_for_delivery" || o.courier_id.as_deref() != Some(&u.id) {
         return Err(ApiError::forbidden());
     }
     let last: Option<i64> =
         sqlx::query_scalar("SELECT reported_at FROM delivery_locations WHERE order_id=?")
-            .bind(&oid)
+            .bind(oid)
             .fetch_optional(&mut *tx)
             .await?;
     if last.is_some_and(|t| now() - t < 3) {
@@ -152,19 +165,22 @@ pub async fn update_location(
         ));
     }
     let timestamp = now();
-    sqlx::query("INSERT INTO delivery_locations VALUES(?,?,?,?,?) ON DUPLICATE KEY UPDATE courier_id=VALUES(courier_id),lat=VALUES(lat),lng=VALUES(lng),reported_at=VALUES(reported_at)").bind(&oid).bind(&u.id).bind(v.lat).bind(v.lng).bind(timestamp).execute(&mut *tx).await?;
+    sqlx::query("INSERT INTO delivery_locations(order_id,courier_id,lat,lng,reported_at,heading,speed,observed_at) VALUES(?,?,?,?,?,?,?,?) ON DUPLICATE KEY UPDATE courier_id=VALUES(courier_id),lat=VALUES(lat),lng=VALUES(lng),reported_at=VALUES(reported_at),heading=VALUES(heading),speed=VALUES(speed),observed_at=VALUES(observed_at)").bind(oid).bind(&u.id).bind(v.lat).bind(v.lng).bind(timestamp).bind(v.heading).bind(v.speed).bind(v.observed_at).execute(&mut *tx).await?;
     tx.commit().await?;
     let _ = s.events.send((
-        oid,
+        oid.to_owned(),
         OrderEvent::Location(CourierLocation {
             lat: v.lat,
             lng: v.lng,
             reported_at: timestamp,
+            heading: v.heading,
+            speed: v.speed,
+            observed_at: v.observed_at,
         }),
     ));
-    Ok(Json(PositionResult {
+    Ok(PositionResult {
         reported_at: timestamp,
-    }))
+    })
 }
 pub async fn location(
     State(s): State<App>,
@@ -175,20 +191,26 @@ pub async fn location(
     if o.status != "out_for_delivery" {
         return Err(ApiError::conflict("Location sharing is not active"));
     }
-    let row: Option<(f64, f64, i64)> =
-        sqlx::query_as("SELECT lat,lng,reported_at FROM delivery_locations WHERE order_id=?")
+    type LocationRow = (f64, f64, i64, Option<f64>, Option<f64>, Option<i64>);
+    let row: Option<LocationRow> =
+        sqlx::query_as("SELECT lat,lng,reported_at,heading,speed,observed_at FROM delivery_locations WHERE order_id=?")
             .bind(oid)
             .fetch_optional(&s.db)
             .await?;
     Ok(Json(
-        row.map(|(lat, lng, reported_at)| LocationSnapshot::Report {
-            position: CourierLocation {
-                lat,
-                lng,
-                reported_at,
+        row.map(
+            |(lat, lng, reported_at, heading, speed, observed_at)| LocationSnapshot::Report {
+                position: CourierLocation {
+                    lat,
+                    lng,
+                    reported_at,
+                    heading,
+                    speed,
+                    observed_at,
+                },
+                stale: now() - reported_at > 15,
             },
-            stale: now() - reported_at > 15,
-        })
+        )
         .unwrap_or(LocationSnapshot::Missing {
             location: (),
             stale: true,
@@ -259,4 +281,149 @@ async fn session_valid(s: &App, u: &User, oid: &str, token: &SessionToken) -> bo
         Ok(current) if current.id == u.id => chat_access(s, &current, oid).await.is_ok(),
         _ => false,
     }
+}
+
+#[derive(serde::Deserialize)]
+pub struct TrackingQuery {
+    order_id: String,
+}
+
+async fn tracking_access(s: &App, u: &User, oid: &str) -> Result<orders::Order> {
+    let o = orders::access(s, u, oid).await?;
+    let permitted = (u.role == "customer" && o.customer_id == u.id)
+        || (matches!(u.role.as_str(), "courier" | "admin")
+            && o.courier_id.as_deref() == Some(&u.id));
+    if !permitted || o.status != "out_for_delivery" || o.courier_id.is_none() {
+        return Err(ApiError::forbidden());
+    }
+    Ok(o)
+}
+
+pub async fn tracking_websocket(
+    State(s): State<App>,
+    u: User,
+    headers: HeaderMap,
+    Query(query): Query<TrackingQuery>,
+    ws: WebSocketUpgrade,
+) -> Result<Response> {
+    if headers.get("origin").and_then(|v| v.to_str().ok()) != Some(&s.origin) {
+        return Err(ApiError::forbidden());
+    }
+    let oid = tracking_access(&s, &u, &query.order_id).await?.id;
+    let token = crate::auth::session_token(&headers).ok_or_else(ApiError::forbidden)?;
+    Ok(ws
+        .max_message_size(4096)
+        .on_upgrade(move |socket| tracking(socket, s, u, oid, token)))
+}
+
+async fn tracking_valid(s: &App, u: &User, oid: &str, token: &SessionToken) -> bool {
+    let mut headers = HeaderMap::new();
+    let Ok(cookie) = format!("{SESSION_COOKIE}={}", token.secret()).parse() else {
+        return false;
+    };
+    headers.insert("cookie", cookie);
+    match crate::auth::authenticate(s, &headers).await {
+        Ok(current) if current.id == u.id && current.role == u.role => {
+            tracking_access(s, &current, oid).await.is_ok()
+        }
+        _ => false,
+    }
+}
+
+async fn tracking(socket: WebSocket, s: App, u: User, oid: String, token: SessionToken) {
+    let mut rx = s.events.subscribe();
+    let (mut output, mut input) = socket.split();
+    let mut timer = tokio::time::interval(std::time::Duration::from_secs(15));
+    loop {
+        tokio::select! {
+            incoming = input.next() => match incoming {
+                Some(Ok(Message::Text(text))) => {
+                    if !tracking_valid(&s, &u, &oid, &token).await || u.role == "customer" { break; }
+                    let Ok(position) = serde_json::from_str::<Position>(&text) else { break; };
+                    if position.observed_at.is_none() || s.rate_limits.rider(token.secret()).is_err() { break; }
+                    if let Err(error) = store_location(&s, &u, &oid, position).await {
+                        let body = json!({"error": error.1}).to_string();
+                        if output.send(Message::Text(body.into())).await.is_err() || matches!(error.0, StatusCode::FORBIDDEN | StatusCode::CONFLICT | StatusCode::UNAUTHORIZED) { break; }
+                    }
+                }
+                Some(Ok(Message::Close(_))) | None | Some(Err(_)) => break,
+                _ => {}
+            },
+            event = rx.recv() => match event {
+                Ok((order, value)) if order == oid => {
+                    if !tracking_valid(&s, &u, &oid, &token).await { break; }
+                    if matches!(value, OrderEvent::Location(_)) && output.send(Message::Text(serde_json::to_string(&value).expect("serializable event").into())).await.is_err() { break; }
+                }
+                Err(broadcast::error::RecvError::Closed) => break,
+                _ => {}
+            },
+            _ = timer.tick() => {
+                if !tracking_valid(&s, &u, &oid, &token).await || output.send(Message::Ping(Vec::new().into())).await.is_err() { break; }
+            }
+        }
+    }
+    let _ = output.close().await;
+}
+
+pub async fn eta(
+    State(s): State<App>,
+    u: User,
+    Path(oid): Path<String>,
+) -> Result<Json<suki_shared::realtime::Eta>> {
+    u.require(&["customer"])?;
+    let order = tracking_access(&s, &u, &oid).await?;
+    if s.maps_key.is_empty() {
+        return Err(ApiError(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Route estimates are unavailable".into(),
+        ));
+    }
+    let (lat, lng, reported): (f64, f64, i64) =
+        sqlx::query_as("SELECT lat,lng,reported_at FROM delivery_locations WHERE order_id=?")
+            .bind(&oid)
+            .fetch_optional(&s.db)
+            .await?
+            .ok_or(ApiError::conflict("Waiting for rider location"))?;
+    if now() - reported > 30 {
+        return Err(ApiError::conflict("Rider location is stale"));
+    }
+    s.rate_limits.eta(&u.id)?;
+    let response = s.client.post(&s.maps_url).header("X-Goog-Api-Key", &s.maps_key)
+        .header("X-Goog-FieldMask", "routes.distanceMeters,routes.duration")
+        .json(&json!({"origin":{"location":{"latLng":{"latitude":lat,"longitude":lng}}},"destination":{"location":{"latLng":{"latitude":order.lat,"longitude":order.lng}}},"travelMode":"DRIVE","routingPreference":"TRAFFIC_UNAWARE","computeAlternativeRoutes":false}))
+        .send().await.map_err(|_| ApiError(StatusCode::BAD_GATEWAY, "Route service unavailable".into()))?;
+    if !response.status().is_success() {
+        return Err(ApiError(
+            StatusCode::BAD_GATEWAY,
+            "Route service unavailable".into(),
+        ));
+    }
+    let body: serde_json::Value = response
+        .json()
+        .await
+        .map_err(|_| ApiError(StatusCode::BAD_GATEWAY, "Invalid route response".into()))?;
+    let meters = body
+        .pointer("/routes/0/distanceMeters")
+        .and_then(|v| v.as_i64())
+        .filter(|n| *n >= 0)
+        .ok_or(ApiError(
+            StatusCode::BAD_GATEWAY,
+            "Invalid route distance".into(),
+        ))?;
+    let seconds = body
+        .pointer("/routes/0/duration")
+        .and_then(|v| v.as_str())
+        .and_then(|v| v.strip_suffix('s'))
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|n| n.is_finite() && *n >= 0.0 && *n < 604800.0)
+        .ok_or(ApiError(
+            StatusCode::BAD_GATEWAY,
+            "Invalid route duration".into(),
+        ))?;
+    tracking_access(&s, &u, &oid).await?;
+    Ok(Json(suki_shared::realtime::Eta {
+        distance_meters: meters,
+        duration_seconds: seconds.ceil() as i64,
+        calculated_at: now(),
+    }))
 }

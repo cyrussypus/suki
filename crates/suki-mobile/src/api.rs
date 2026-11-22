@@ -95,6 +95,23 @@ impl Api {
         })
     }
 
+    /// R2 URLs are supplied by the server, never by product form inputs.
+    pub fn product_image(&self, product: &suki_shared::catalog::Product) -> Option<String> {
+        product
+            .image_url
+            .as_deref()
+            .and_then(|url| {
+                let parsed = Url::parse(url).ok()?;
+                (parsed.scheme() == "https"
+                    && parsed.host_str().is_some()
+                    && parsed.username().is_empty()
+                    && parsed.password().is_none()
+                    && parsed.fragment().is_none())
+                .then(|| parsed.to_string())
+            })
+            .or_else(|| self.image(&product.image))
+    }
+
     pub fn image(&self, path: &str) -> Option<String> {
         if !path.starts_with("/images/") || path.contains("..") || path.contains('\\') {
             return None;
@@ -175,6 +192,28 @@ impl Api {
         .await
     }
 
+    pub async fn upload_avatar(
+        &self,
+        photo: Vec<u8>,
+    ) -> Result<suki_shared::catalog::AvatarImage, Failure> {
+        let url = self
+            .origin
+            .join("/api/upload/avatar")
+            .expect("internal API path");
+        let form = reqwest::multipart::Form::new().part(
+            "photo",
+            reqwest::multipart::Part::bytes(photo).file_name("avatar"),
+        );
+        Self::execute(
+            self.client
+                .post(url)
+                .header("X-Suki-Request", "1")
+                .timeout(std::time::Duration::from_secs(30))
+                .multipart(form),
+        )
+        .await
+    }
+
     async fn execute<T: DeserializeOwned + Send + 'static>(
         request: reqwest::RequestBuilder,
     ) -> Result<T, Failure> {
@@ -203,10 +242,15 @@ impl Api {
     }
 
     pub fn events(&self, order_id: &str) -> EventStream {
-        let mut url = self
-            .origin
-            .join(&format!("/api/orders/{order_id}/chat/ws"))
-            .expect("internal event path");
+        self.event_stream(&format!("/api/orders/{order_id}/chat/ws"))
+    }
+
+    pub fn tracking_events(&self, order_id: &str) -> EventStream {
+        self.event_stream(&format!("/api/rider/location/stream?order_id={order_id}"))
+    }
+
+    fn event_stream(&self, path: &str) -> EventStream {
+        let mut url = self.origin.join(path).expect("internal event path");
         url.set_scheme(if url.scheme() == "https" { "wss" } else { "ws" })
             .expect("WebSocket scheme");
 
@@ -288,6 +332,79 @@ impl Api {
                 rx.recv().await.map(|event| (event, rx))
             }))
         }
+    }
+    pub fn location_sender(
+        &self,
+        order_id: &str,
+    ) -> futures_channel::mpsc::UnboundedSender<String> {
+        let mut url = self
+            .origin
+            .join(&format!("/api/rider/location/stream?order_id={order_id}"))
+            .expect("internal tracking path");
+        url.set_scheme(if url.scheme() == "https" { "wss" } else { "ws" })
+            .expect("WebSocket scheme");
+        let (tx, mut rx) = futures_channel::mpsc::unbounded::<String>();
+        #[cfg(target_arch = "wasm32")]
+        {
+            use futures_util::SinkExt;
+            use gloo_net::websocket::{Message, State, futures::WebSocket};
+            let Ok(socket) = WebSocket::open(url.as_str()) else {
+                return tx;
+            };
+            dioxus::prelude::spawn(async move {
+                for _ in 0..100 {
+                    match socket.state() {
+                        State::Open => break,
+                        State::Connecting => delay(100).await,
+                        _ => return,
+                    }
+                }
+                if !matches!(socket.state(), State::Open) {
+                    return;
+                }
+                let (mut output, input) = socket.split();
+                let mut input = input.fuse();
+                loop {
+                    futures_util::select! {
+                        payload = rx.next() => match payload { Some(body) => if output.send(Message::Text(body)).await.is_err() { break; }, None => break },
+                        frame = input.next() => match frame { Some(Ok(Message::Text(text))) if text.contains("\"error\"") => break, Some(Ok(_)) => {}, _ => break },
+                    }
+                }
+            });
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            use futures_util::SinkExt;
+            use reqwest::cookie::CookieStore;
+            use tokio_tungstenite::{
+                connect_async,
+                tungstenite::{Message, client::IntoClientRequest},
+            };
+            let mut request = url
+                .as_str()
+                .into_client_request()
+                .expect("valid WebSocket URL");
+            let origin = self.origin.origin().ascii_serialization();
+            let origin = option_env!("SUKI_APP_ORIGIN").unwrap_or(&origin);
+            let Ok(origin) = origin.parse() else {
+                return tx;
+            };
+            request.headers_mut().insert("origin", origin);
+            if let Some(cookie) = self.cookies.cookies(&self.origin) {
+                request.headers_mut().insert("cookie", cookie);
+            }
+            runtime().spawn(async move {
+                let Ok(Ok((socket, _))) = tokio::time::timeout(std::time::Duration::from_secs(10), connect_async(request)).await else { return; };
+                let (mut output, mut input) = socket.split();
+                loop {
+                    tokio::select! {
+                        payload = rx.next() => match payload { Some(body) => if output.send(Message::Text(body.into())).await.is_err() { break; }, None => break },
+                        frame = input.next() => match frame { Some(Ok(Message::Text(text))) if text.contains("\"error\"") => break, Some(Ok(Message::Close(_))) | None | Some(Err(_)) => break, _ => {} },
+                    }
+                }
+            });
+        }
+        tx
     }
 }
 

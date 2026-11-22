@@ -56,11 +56,17 @@ pub struct MessageInput {
     pub content: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[derive(Debug, Default, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Position {
     pub lat: f64,
     pub lng: f64,
+    #[serde(default)]
+    pub heading: Option<f64>,
+    #[serde(default)]
+    pub speed: Option<f64>,
+    #[serde(default)]
+    pub observed_at: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
@@ -68,6 +74,12 @@ pub struct CourierLocation {
     pub lat: f64,
     pub lng: f64,
     pub reported_at: i64,
+    #[serde(default)]
+    pub heading: Option<f64>,
+    #[serde(default)]
+    pub speed: Option<f64>,
+    #[serde(default)]
+    pub observed_at: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
@@ -96,4 +108,11 @@ pub enum OrderEvent {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct PositionResult {
     pub reported_at: i64,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct Eta {
+    pub distance_meters: i64,
+    pub duration_seconds: i64,
+    pub calculated_at: i64,
 }

@@ -6,7 +6,17 @@ Startup applies the versioned migrations before listening. The bootstrap adminis
 
 The API binary is `suki-api`. Its image directory can be configured with `SUKI_IMAGE_DIR`. The optional development preview and the native client use the same API endpoints.
 
+<!-- coderabbit-ai-generated:v1 -->
+
+<!-- coderabbit-ai-generated-section:v1:e8b0d7769c198d15fdc53fefe9563b4594350f6b09129408416b0031115f3fda -->
+
 ## Security and storage
+
+Admin privileges require an active administrator account and an email in the server's comma-separated `ADMIN_EMAILS`. Matching ignores surrounding whitespace and letter case. Set the variable before upgrading: an absent or empty list disables admin access. An unlisted administrator receives HTTP 403 at sign-in and on existing authenticated sessions. An allowlisted email does not grant the admin role. The list is loaded at API startup, so restart each instance after editing it. Keep the list when removing the one-time bootstrap credentials, and include the bootstrap email when creating the first admin.
+
+The client uses the server's `admin_access` flag from `GET /api/auth/me` to show the admin dashboard. The API independently enforces both checks before allowing admin operations.
+
+<!-- /coderabbit-ai-generated:v1 -->
 
 - Argon2id password hashes; bounded password workers; per-identity authentication attempt limits.
 - Random opaque session cookies, HttpOnly, SameSite=Lax, optional development-only insecure mode. Only SHA-256 token hashes are stored. Sessions expire after seven days, logout removes them, and administrative account changes revoke them.
@@ -89,7 +99,23 @@ Marketplace endpoints (prefix `/api`):
 
 The new quote uses `max(8500, round((700 × meters + 500 × grams) / 1000))`. Customer checkout supplies `payment_method` (`gcash` or `cash_on_delivery`). Prices and weight are verified again before the order is placed. The legacy quote endpoint is disabled by default; `SUKI_ALLOW_LEGACY_QUOTES=true` temporarily enables it for older deployments. Existing orders use their snapshotted amounts and payment rules.
 
-The backend re-encodes vendor photos before serving them and stores them under `SUKI_MEDIA_DIR`. Back up that directory with MariaDB. Replaced files are retained so historical URLs remain readable; an operator can reclaim unreferenced files offline. Native and browser clients upload through the same API.
+<!-- coderabbit-ai-generated:v1 -->
+
+<!-- coderabbit-ai-generated-section:v1:7674e36f0c66c2383be8ed49d3cef62102d520ced4325270d623c726b6fe8cd1 -->
+
+The backend accepts JPEG, PNG and WebP images up to 5 MiB, validates and re-encodes them, then uploads JPEG objects to Cloudflare R2. Configure all five `R2_ACCOUNT_ID`, `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`, `R2_BUCKET_NAME` and `R2_PUBLIC_DOMAIN` variables; the public domain must be an HTTPS origin. Missing R2 settings make new uploads unavailable. `R2_ENDPOINT_URL` optionally selects a test endpoint; plain HTTP is accepted only for loopback. Credentials stay on the server.
+
+<!-- coderabbit-ai-generated:v1 -->
+
+<!-- coderabbit-ai-generated-section:v1:fcbb3242037a160db6ac84a12b12d444d44f274a8921288cf2bab259003fba84 -->
+
+`POST /api/upload/avatar` updates the authenticated user's avatar; `POST /api/upload/products/{id}` is restricted to the owning vendor. Existing vendor goods forms use R2 too. Both accept multipart `photo`. The server stores object metadata, ownership and R2 URLs in MariaDB and retains old objects so historical same-origin image paths continue to work. New product responses include `image_url`; the current mobile client uses this HTTPS R2 URL directly and falls back to `image` for existing photos. Existing `SUKI_MEDIA_DIR` images remain readable and must still be backed up. R2 uploads and SQL commits are separate operations: a failed database write can leave an unreferenced object, which operators should reconcile before deleting. The configured public domain must resolve to the bucket for direct photo access.
+
+<!-- /coderabbit-ai-generated:v1 -->
+
+Authentication routes allow five requests per minute per socket IP; uploads allow ten requests per minute per authenticated user; courier location updates allow 120 requests per minute per session. The API ignores forwarded IP headers, so configure an ingress limit per client when behind a proxy. Limits are held in each API process and reset on restart; distributed deployments require shared ingress enforcement.
+
+<!-- /coderabbit-ai-generated:v1 -->
 
 Real Google routing and GCash transactions need provider testing. The database integration test uses its own synthetic Routes server.
 

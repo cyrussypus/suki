@@ -294,6 +294,12 @@ pub fn OrderScreen(id: String) -> Element {
                     }
                 }
             }
+            if user.as_ref().is_some_and(|u| u.has_role(Role::Customer)) && data.order.status == "out_for_delivery" {
+                crate::tracking::LiveMap { order: data.order.clone(), location }
+            }
+            if user.as_ref().is_some_and(|u| u.has_role(Role::Customer)) && matches!(data.order.status.as_str(), "delivered" | "completed") && data.order.delivered_at.is_some() {
+                crate::tracking::Reviews { order: data.order.clone() }
+            }
             Chat { path, messages }
         } else if (problem)().is_empty() {
             p { "Loading order…" }
@@ -649,10 +655,10 @@ fn CourierReport(path: String) -> Element {
     let mut busy = use_signal(|| false);
     let mut sharing = use_signal(|| false);
     let location_api = api.clone();
-    let location_path = format!("{path}/location");
+    let order_id = path.trim_start_matches("/orders/").to_owned();
     use_resource(move || {
         let active = sharing();
-        let (api, endpoint) = (location_api.clone(), location_path.clone());
+        let (api, order_id) = (location_api.clone(), order_id.clone());
         async move {
             if !active {
                 return;
@@ -665,22 +671,17 @@ fn CourierReport(path: String) -> Element {
                     return;
                 }
             };
+            let sender = api.location_sender(&order_id);
             loop {
                 match source.position().await {
                     Ok(position) => {
-                        match api
-                            .send::<PositionResult, _>(Method::PUT, &endpoint, &position)
-                            .await
-                        {
-                            Ok(_) => status.set("Live rider location shared.".into()),
-                            Err(error) => {
-                                status.set(error.to_string());
-                                if matches!(error.status, Some(401 | 403 | 409)) {
-                                    sharing.set(false);
-                                    break;
-                                }
-                            }
+                        let body = serde_json::to_string(&position).expect("serializable position");
+                        if sender.unbounded_send(body).is_err() {
+                            status.set("Tracking disconnected. Please share again.".into());
+                            sharing.set(false);
+                            break;
                         }
+                        status.set("Sharing rider location.".into());
                     }
                     Err(error) => status.set(error),
                 }
@@ -709,7 +710,7 @@ fn CourierReport(path: String) -> Element {
             let endpoint = format!("{path}/location");
             busy.set(true);
             spawn(async move {
-                let response = api.send::<PositionResult, _>(Method::PUT, &endpoint, &Position { lat, lng }).await;
+                let response = api.send::<PositionResult, _>(Method::PUT, &endpoint, &Position { lat, lng, ..Default::default() }).await;
                 status.set(response.map_or_else(|failure| failure.to_string(), |_| "Location reported.".into()));
                 busy.set(false);
             });
