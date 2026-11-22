@@ -13,9 +13,9 @@ nav{position:fixed;bottom:0;left:0;right:0;justify-content:center;border-top:1px
 nav button{flex:1;border:0;background:transparent;white-space:nowrap}
 nav button[aria-current=page]{background:#dfeddf;color:#173d29}
 .brand{display:flex;align-items:center;gap:.65rem;color:var(--green)}
-.brand>span{display:grid;place-items:center;width:2.4rem;height:2.4rem;background:var(--green);color:#fff;font-size:1.25rem;font-weight:800;border-radius:.8rem}
-.brand strong,.brand small,.order-link small{display:block}
-.brand strong{font-size:1.25rem;line-height:1.05}
+.brand-logo{display:block;width:4rem;height:4rem;object-fit:contain}
+.brand small,.order-link small{display:block}
+
 .brand small{font-size:.65rem;font-weight:700;letter-spacing:.13em}
 main{width:min(100%,67rem);margin:auto;padding:1rem 1rem 7rem}
 section{margin:0 0 1rem}
@@ -84,8 +84,8 @@ button.primary{background:#713f51;border-color:#713f51;color:#fff}
 button:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-visible{outline-color:#d9745e}
 header{background:#faf7f3;border:0;padding-top:max(.85rem,env(safe-area-inset-top));padding-bottom:.85rem}
 .brand{color:#713f51;gap:.55rem}
-.brand>span{width:2.6rem;height:2.6rem;background:#713f51;border-radius:1rem 1rem 1rem .25rem;font-family:Georgia,serif;font-style:italic;font-size:1.8rem}
-.brand strong{font-family:Georgia,serif;font-size:1.65rem;letter-spacing:-.06em}
+
+
 .brand small{font-size:.57rem;letter-spacing:.15em;color:#9b7c82;margin-top:.2rem}
 .basket-shortcut{background:#fff;border:1px solid #eddfdc;border-radius:2rem;font-size:.8rem;color:#713f51}
 .basket-shortcut svg{width:1.1rem;height:1.1rem;vertical-align:middle;fill:none;stroke:currentColor;stroke-width:1.7;stroke-linecap:round;stroke-linejoin:round}.basket-shortcut b{display:inline-grid;place-items:center;background:#d77360;color:white;border-radius:50%;min-width:1.3rem;height:1.3rem;margin-left:.25rem;font-size:.7rem}

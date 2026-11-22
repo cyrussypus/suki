@@ -113,9 +113,11 @@ fn App() -> Element {
         .is_some_and(|a| can_open_dashboard(a, admin_access));
     let vendor = account.as_ref().is_some_and(|a| a.has_role(Role::Vendor));
     rsx! {
+        document::Title { "Suki Davao" }
+        document::Link { rel: "icon", r#type: "image/png", href: asset!("/assets/suki-icon.png") }
         style { {include_str!("style.css")} }
         header {
-            div { class: "brand", span { "s" } div { strong { "suki" } small { "YOUR DAVAO MARKET" } } }
+            div { class: "brand", img { class: "brand-logo", src: asset!("/assets/suki-logo.png"), alt: "Suki" } small { "YOUR DAVAO MARKET" } }
             if customer {
                 button { class: "basket-shortcut", aria_label: "Open basket, {basket_count} items", onclick: move |_| state.page.set(Page::Basket),
                     svg { view_box: "0 0 24 24", path { d: "M4 9h16l-1 11H5L4 9zM8 9V7a4 4 0 0 1 8 0v2" } } " Basket" if basket_count > 0 { b { "{basket_count}" } }
