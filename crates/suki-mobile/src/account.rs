@@ -4,7 +4,7 @@ use dioxus::prelude::*;
 use reqwest::Method;
 use suki_shared::{
     Acknowledged,
-    auth::{Account, Login, Registration, RegistrationResult, Role, SessionAccount},
+    auth::{Account, AccountStatus, Login, Registration, RegistrationResult, Role, SessionAccount},
 };
 
 #[component]
@@ -13,7 +13,7 @@ pub fn AccountScreen() -> Element {
     let mut state = use_context::<State>();
     let mut busy = use_signal(|| false);
     let mut register = use_signal(|| false);
-    let mut vendor_signup = use_signal(|| false);
+    let mut signup_role = use_signal(|| Role::Customer);
     let mut email = use_signal(String::new);
     let mut password = use_signal(String::new);
     let mut name = use_signal(String::new);
@@ -125,8 +125,8 @@ pub fn AccountScreen() -> Element {
                     let registration = register().then(|| Registration {
                         name: name(), email: login.email.clone(), phone: phone(),
                         password: login.password.clone(),
-                        role: if vendor_signup() { Role::Vendor } else { Role::Customer }.as_str().into(),
-                        shop_name: vendor_signup().then(&*shop),
+                        role: signup_role().as_str().into(),
+                        shop_name: (signup_role() == Role::Vendor).then(&*shop),
                     });
                     busy.set(true);
                     error.set(String::new());
@@ -134,18 +134,22 @@ pub fn AccountScreen() -> Element {
                         let result = async {
                             if let Some(registration) = registration {
                                 let result: RegistrationResult = api.send(Method::POST, "/auth/register", &registration).await?;
-                                if result.status == "pending" {
+                                if result.status == AccountStatus::PendingApproval.as_str() {
                                     register.set(false);
                                     password.set(String::new());
-                                    state.notice.set("Your vendor account is awaiting administrator approval.".into());
+                                    state.notice.set("Your application is awaiting administrator approval.".into());
                                     return Ok::<_, crate::api::Failure>(());
                                 }
                                 register.set(false);
                             }
                             api.send::<Acknowledged, _>(Method::POST, "/auth/login", &login).await?;
-                            let SessionAccount { account, admin_access } = api.get("/auth/me").await?;
+                            let SessionAccount { account, admin_access, approved_at } = api.get("/auth/me").await?;
                             state.admin_access.set(admin_access);
-                            state.notice.set(format!("Welcome, {}.", account.name));
+                            state.notice.set(if approved_at.is_some() && matches!(account.role.as_str(), "vendor" | "courier") {
+                                "Your application has been approved. Your dashboard is ready.".into()
+                            } else {
+                                format!("Welcome, {}.", account.name)
+                            });
                             state.page.set(crate::home_for(&account, admin_access));
                             state.account.set(Some(account));
                             password.set(String::new());
@@ -159,8 +163,14 @@ pub fn AccountScreen() -> Element {
                     if register() {
                         label { "Name" input { required: true, autocomplete: "name", value: "{name}", oninput: move |e| name.set(e.value()) } }
                         label { "Phone" input { required: true, r#type: "tel", autocomplete: "tel", value: "{phone}", oninput: move |e| phone.set(e.value()) } }
-                        label { class: "check", input { r#type: "checkbox", checked: vendor_signup(), onchange: move |e| vendor_signup.set(e.checked()) } "Register as a vendor" }
-                        if vendor_signup() {
+                        label { "Account type" select { value: signup_role().as_str(), onchange: move |e| signup_role.set(match e.value().as_str() {
+                            "vendor" => Role::Vendor, "courier" => Role::Rider, _ => Role::Customer,
+                        }),
+                            option { value: "customer", "Customer" }
+                            option { value: "vendor", "Vendor" }
+                            option { value: "courier", "Rider" }
+                        } }
+                        if signup_role() == Role::Vendor {
                             label { "Shop name" input { required: true, value: "{shop}", oninput: move |e| shop.set(e.value()) } }
                         }
                     }

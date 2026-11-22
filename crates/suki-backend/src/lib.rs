@@ -8,6 +8,7 @@ pub mod limits;
 pub mod media;
 pub mod orders;
 pub mod payments;
+pub mod protected;
 pub mod realtime;
 pub mod reviews;
 pub mod snapshots;
@@ -37,6 +38,7 @@ pub struct AppState {
     pub db: MySqlPool,
     pub rate_limits: Arc<limits::RateLimits>,
     pub admin_emails: auth::AdminEmails,
+    pub field_cipher: Arc<protected::FieldCipher>,
     pub integrity_key: suki_shared::crypto::IntegrityKey,
     pub client: reqwest::Client,
     pub secure_cookies: bool,
@@ -264,6 +266,8 @@ pub fn router(s: App) -> Router {
             Router::new()
                 .route("/users", get(admin::users))
                 .route("/users/{id}", patch(admin::update_user))
+                .route("/users/{id}/approve", post(admin::approve))
+                .route("/users/{id}/reject", post(admin::reject))
                 .route("/reports", get(admin::reports))
                 .route("/audit", get(admin::logs))
                 .route("/orders/{id}/integrity", get(integrity::inspect))

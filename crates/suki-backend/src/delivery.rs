@@ -59,7 +59,7 @@ async fn quote_inner(
     weight: Option<i64>,
 ) -> Result<Json<DeliveryQuote>> {
     u.require(&["customer"])?;
-    let address = text(&v.address, 10, 500)?;
+    let address = protected::address_input(&v.address, 10, 500)?;
     let settings = crate::admin::load(&s.db).await?;
     coverage(&settings, v.lat, v.lng)?;
     if s.maps_key.is_empty() {
@@ -118,7 +118,7 @@ async fn quote_inner(
     };
     let qid = id();
     let expires_at = now() + 600;
-    sqlx::query("INSERT INTO delivery_quotes(id,customer_id,address,lat,lng,distance_meters,fee_centavos,base_fee_centavos,per_km_centavos,expires_at,weight_grams) VALUES (?,?,?,?,?,?,?,?,?,?,?)").bind(&qid).bind(&u.id).bind(&address).bind(v.lat).bind(v.lng).bind(meters).bind(fee).bind(base).bind(per_km).bind(expires_at).bind(weight).execute(&s.db).await?;
+    sqlx::query("INSERT INTO delivery_quotes(id,customer_id,address_encrypted,distance_meters,fee_centavos,base_fee_centavos,per_km_centavos,expires_at,weight_grams) VALUES (?,?,?,?,?,?,?,?,?)").bind(&qid).bind(&u.id).bind(s.field_cipher.encode("quotes.address", &qid, &protected::Destination { address: address.clone(), lat: v.lat, lng: v.lng })?).bind(meters).bind(fee).bind(base).bind(per_km).bind(expires_at).bind(weight).execute(&s.db).await?;
     Ok(Json(DeliveryQuote {
         id: qid,
         address,

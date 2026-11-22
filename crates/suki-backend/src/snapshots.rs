@@ -2,14 +2,14 @@ use crate::{auth::User, *};
 use axum::extract::Path;
 use sqlx::{Executor, MySql};
 use suki_shared::{
-    crypto::{IntegrityKey, SNAPSHOT_AUTH, hash_snapshot},
+    crypto::{SNAPSHOT_AUTH, hash_snapshot},
     snapshots::{OrderSnapshot, SnapshotPayload},
 };
 
 #[derive(sqlx::FromRow)]
 pub(crate) struct StoredSnapshot {
     pub order_id: String,
-    payload: Vec<u8>,
+    payload_encrypted: Vec<u8>,
     pub snapshot_hash: String,
     pub signature: String,
 }
@@ -19,13 +19,19 @@ pub(crate) fn invalid() -> ApiError {
 }
 
 impl StoredSnapshot {
-    pub fn verified(self, key: &IntegrityKey) -> Result<OrderSnapshot> {
-        if hash_snapshot(&self.payload) != self.snapshot_hash
-            || !key.verify(SNAPSHOT_AUTH, &self.snapshot_hash, &self.signature)
+    pub fn verified(self, s: &App) -> Result<OrderSnapshot> {
+        let bytes = s
+            .field_cipher
+            .open("receipt", &self.order_id, &self.payload_encrypted)
+            .map_err(|_| invalid())?;
+        if hash_snapshot(&bytes) != self.snapshot_hash
+            || !s
+                .integrity_key
+                .verify(SNAPSHOT_AUTH, &self.snapshot_hash, &self.signature)
         {
             return Err(invalid());
         }
-        let payload = serde_json::from_slice(&self.payload).map_err(|_| invalid())?;
+        let payload = serde_json::from_slice(&bytes).map_err(|_| invalid())?;
         let receipt = OrderSnapshot {
             payload,
             snapshot_hash: self.snapshot_hash,
@@ -43,7 +49,7 @@ pub(crate) async fn load<'e>(
     order: &str,
 ) -> Result<Option<StoredSnapshot>> {
     Ok(sqlx::query_as(
-        "SELECT order_id,payload,snapshot_hash,signature FROM order_snapshots WHERE order_id=?",
+        "SELECT order_id,payload_encrypted,snapshot_hash,signature FROM order_snapshots WHERE order_id=?",
     )
     .bind(order)
     .fetch_optional(db)
@@ -68,12 +74,12 @@ impl ReceiptState {
 
 pub(crate) async fn receipt(
     tx: &mut sqlx::Transaction<'_, MySql>,
-    key: &IntegrityKey,
+    s: &App,
     order: &str,
     customer: &str,
 ) -> Result<ReceiptState> {
     if let Some(row) = load(&mut **tx, order).await? {
-        match row.verified(key) {
+        match row.verified(s) {
             Ok(snapshot) if snapshot.payload.customer_id == customer => {
                 Ok(ReceiptState::Verified(Box::new(snapshot)))
             }
@@ -93,17 +99,17 @@ pub(crate) async fn receipt(
 
 pub(crate) async fn store(
     tx: &mut sqlx::Transaction<'_, MySql>,
-    key: &IntegrityKey,
+    s: &App,
     payload: SnapshotPayload,
 ) -> Result<OrderSnapshot> {
     let json = serde_json::to_vec(&payload).map_err(|_| invalid())?;
     let snapshot_hash = hash_snapshot(&json);
-    let signature = key.sign(SNAPSHOT_AUTH, &snapshot_hash);
+    let signature = s.integrity_key.sign(SNAPSHOT_AUTH, &snapshot_hash);
     sqlx::query(
-        "INSERT INTO order_snapshots(order_id,payload,snapshot_hash,signature) VALUES(?,?,?,?)",
+        "INSERT INTO order_snapshots(order_id,payload_encrypted,snapshot_hash,signature) VALUES(?,?,?,?)",
     )
     .bind(&payload.order_id)
-    .bind(json)
+    .bind(s.field_cipher.seal("receipt", &payload.order_id, &json)?)
     .bind(&snapshot_hash)
     .bind(&signature)
     .execute(&mut **tx)
@@ -122,7 +128,7 @@ pub async fn get(
 ) -> Result<Json<OrderSnapshot>> {
     let order = orders::access(&s, &u, &order).await?;
     let mut tx = s.db.begin().await?;
-    let snapshot = receipt(&mut tx, &s.integrity_key, &order.id, &order.customer_id)
+    let snapshot = receipt(&mut tx, &s, &order.id, &order.customer_id)
         .await?
         .into_result()?;
     snapshot.map(Json).ok_or(ApiError(

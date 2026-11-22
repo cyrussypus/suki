@@ -24,14 +24,28 @@ cargo run --locked
 The API applies migrations before listening. Check `curl --fail http://localhost:8080/api/health`. From the workspace root use `cargo run --locked -p suki-backend` with variables supplied by the shell or your process manager. The sample environment describes administrator bootstrap. Remove bootstrap credentials after first startup.
 
 
+<!-- coderabbit-ai-generated:v1 -->
+
+<!-- coderabbit-ai-generated-section:v1:8630420614d94f7a001d11f5077a57f5956d0e846ff5a5a427604191af799980 -->
+
 Set `SUKI_INTEGRITY_KEY` before starting or upgrading the API. Generate it once with `openssl rand -hex 32`, keep it in your server secret store and back it up separately from MariaDB. All API instances must use the same key. Replacing it without a migration makes existing signatures fail verification. The migration requires permission to create triggers. Apply schema upgrades with older API instances stopped.
 
-**Recover an interrupted integrity migration.** MariaDB commits schema changes separately, so startup can leave part of migration 0004 or 0005 applied. Before upgrading, stop all API instances and other writers and take a validated database backup. Keep writes stopped until the migrated API passes its health check.
+## Account approvals and protected fields
+
+Set `DATA_ENCRYPTION_KEY` to an independently generated 32-byte key (`openssl rand -hex 32`) before starting the API. Keep it in the server secret store and back it up separately from MariaDB. Every instance sharing a database needs the same key. Startup rejects a missing, malformed, or mismatched key. Replacing the key requires a planned re-encryption migration.
+
+Customers can sign in after registering. Vendor and rider applications start pending. An administrator whose email is on the allowlist can approve or reject applications under **Account approvals and role management**. Approval unlocks sign-in and creates a durable decision shown as an in-app notice at sign-in. Rejection keeps sign-in blocked. The admin API allows ten requests per authenticated administrator per minute on each API instance.
+
+Stop all old API instances and other writers, verify a backup, and allow downtime for migration 0008 and its transactional encryption backfill before serving traffic. The migration keeps the original receipt signatures and audit tags. MariaDB DDL can commit independently; if the schema migration stops partway through, follow the recovery procedure below. If the subsequent application backfill fails, it rolls back and startup stays offline. Use the same encryption key on retry. Old database backups, binary logs, and storage snapshots can still contain plaintext; retain or expire them under your existing access policy.
+
+Encryption covers saved address labels and locations, quote and order delivery locations, checkout totals, and signed receipt payloads. Access to existing order and receipt endpoints keeps the same authenticated order permissions. Other accounting fields, including item prices, payment records and adjustments, remain queryable and may let a reader reconstruct totals. This change does not encrypt the whole database.
+
+**Recover an interrupted integrity migration.** MariaDB commits schema changes separately, so startup can leave part of migration 0004, 0005, or 0008 applied. Before upgrading, stop all API instances and other writers and take a validated database backup. Keep writes stopped until the migrated API passes its health check.
 
 If startup fails during migration, stop retries and keep the failed database for inspection. Check the migration records and which schema objects already exist:
 
 ```sql
-SELECT version, success FROM _sqlx_migrations WHERE version IN (4, 5);
+SELECT version, success FROM _sqlx_migrations WHERE version IN (4, 5, 8);
 SHOW TABLES LIKE 'order_integrity';
 SHOW TABLES LIKE 'order_snapshots';
 SHOW COLUMNS FROM payments LIKE 'reference_hash';
@@ -39,7 +53,9 @@ SHOW COLUMNS FROM chat_messages LIKE 'signature';
 SHOW TRIGGERS;
 ```
 
-Restore the pre-upgrade backup into a fresh database, verify the restored migration records, and run the upgrade there with the original signing key. Switch the API to that database only after the upgrade and health checks pass. Keep the failed database unchanged; if anything wrote to it after the backup, reconcile those writes before switching. Do not mark a partial migration successful or drop tables from the failed database to force a retry.
+Restore the pre-upgrade backup into a fresh database, verify the restored migration records, and run the upgrade there with the original signing key and the configured data encryption key. Switch the API to that database only after the upgrade and health checks pass. Keep the failed database unchanged; if anything wrote to it after the backup, reconcile those writes before switching. Do not mark a partial migration successful or drop tables from the failed database to force a retry.
+
+<!-- /coderabbit-ai-generated:v1 -->
 
 
 Use **Order integrity inspector** on the admin dashboard to inspect a full order ID. The server verifies the transaction chain and stored chat signatures. An unsigned transaction entry indicates a write outside the API and blocks further changes through the API until investigated. Orders and chat created before the migration have no historical proof. The chain detects modification of signed entries and gaps before later entries; a privileged database restore or truncation requires an independent backup or checkpoint to detect. GCash fingerprints reject reuse of a normalized reference. Staff still confirm the transfer directly, as a fingerprint cannot prove receipt.

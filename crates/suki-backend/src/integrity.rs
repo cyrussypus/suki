@@ -20,6 +20,7 @@ struct Entry {
     id: i64,
     event: String,
     payload: String,
+    payload_encrypted: Option<Vec<u8>>,
     created_at: i64,
     actor_id: Option<String>,
     tag: Option<String>,
@@ -66,7 +67,7 @@ pub async fn commit(mut tx: Tx<'_>, key: &IntegrityKey, order: &str, actor: &str
     .await?
     .unwrap_or_else(|| GENESIS.into());
     let staged: Vec<Entry> = sqlx::query_as(
-        "SELECT id,event,payload,created_at,actor_id,tag FROM order_integrity WHERE order_id=? AND tag IS NULL ORDER BY id",
+        "SELECT id,event,payload,payload_encrypted,created_at,actor_id,tag FROM order_integrity WHERE order_id=? AND tag IS NULL ORDER BY id",
     )
     .bind(order)
     .fetch_all(&mut *tx)
@@ -115,22 +116,38 @@ pub async fn inspect(
     let mut snapshot_anchor = None;
     {
         let mut entries = sqlx::query_as::<_, Entry>(
-            "SELECT id,event,payload,created_at,actor_id,tag FROM order_integrity WHERE order_id=? ORDER BY id",
+            "SELECT id,event,payload,payload_encrypted,created_at,actor_id,tag FROM order_integrity WHERE order_id=? ORDER BY id",
         ).bind(&order).fetch(&mut *tx);
-        while let Some(entry) = entries.try_next().await? {
+        while let Some(mut entry) = entries.try_next().await? {
+            let payload_valid = match &entry.payload_encrypted {
+                None => true,
+                Some(value) => match s
+                    .field_cipher
+                    .open("legacy-audit", &format!("{order}:{}", entry.id), value)
+                    .ok()
+                    .and_then(|bytes| String::from_utf8(bytes).ok())
+                {
+                    Some(payload) if entry.payload == "{}" => {
+                        entry.payload = payload;
+                        true
+                    }
+                    _ => false,
+                },
+            };
             let is_snapshot = entry.event == "order_snapshots.insert";
             snapshot_event |= is_snapshot;
-            if entry
-                .actor_id
-                .as_deref()
-                .zip(entry.tag.as_deref())
-                .is_some_and(|(actor, tag)| {
-                    s.integrity_key.verify(
-                        TRANSACTION_AUTH,
-                        &entry.hash(&order, actor, &previous),
-                        tag,
-                    )
-                })
+            if payload_valid
+                && entry
+                    .actor_id
+                    .as_deref()
+                    .zip(entry.tag.as_deref())
+                    .is_some_and(|(actor, tag)| {
+                        s.integrity_key.verify(
+                            TRANSACTION_AUTH,
+                            &entry.hash(&order, actor, &previous),
+                            tag,
+                        )
+                    })
                 && invalid_transaction.is_none()
             {
                 verified += 1;
@@ -175,7 +192,7 @@ pub async fn inspect(
                 anchor["snapshot_hash"] == row.snapshot_hash && anchor["signature"] == row.signature
             }) =>
         {
-            if row.verified(&s.integrity_key).is_ok() {
+            if row.verified(&s).is_ok() {
                 SnapshotVerification::Verified
             } else {
                 SnapshotVerification::Invalid

@@ -232,7 +232,7 @@ pub fn OrderScreen(id: String) -> Element {
                 h1 { "Order {short(&data.order.id)}" }
                 strong { class: "badge", "{label(&data.order.status)}" }
                 if data.snapshot.is_none() {
-                p { "{data.order.address}" }
+                p { "{suki_shared::addresses::display_address_text(&data.order.address)}" }
                 for item in data.items.iter() {
                     div { class: "line", key: "{item.id}",
                         span { "{item.name} × {quantity(item.quantity_milli)} {item.unit}" }
@@ -449,7 +449,7 @@ fn CheckoutReceipt(snapshot: OrderSnapshot, order_id: String, payment_status: St
                 p { role: "alert", "This receipt failed its integrity check." }
             } else {
                 strong { class: "badge", "Verified receipt" }
-                p { "{receipt.address} · {date(receipt.created_at)}" }
+                p { "{suki_shared::addresses::display_address_text(&receipt.address)} · {date(receipt.created_at)}" }
                 for item in &receipt.items {
                     div { class: "line", key: "{item.item_id}",
                         span { "{item.name} · {item.vendor_name} · {quantity(item.quantity_milli)} {item.unit} × {peso(item.unit_price_centavos)}" }

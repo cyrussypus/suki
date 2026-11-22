@@ -44,9 +44,10 @@ struct State {
 }
 
 fn can_open_dashboard(account: &Account, admin_access: bool) -> bool {
-    account.has_role(Role::Vendor)
-        || account.has_role(Role::Rider)
-        || (account.has_role(Role::Admin) && admin_access)
+    account.status == suki_shared::auth::AccountStatus::Active.as_str()
+        && (account.has_role(Role::Vendor)
+            || account.has_role(Role::Rider)
+            || (account.has_role(Role::Admin) && admin_access))
 }
 
 fn home_for(account: &Account, admin_access: bool) -> Page {
@@ -93,6 +94,7 @@ fn App() -> Element {
             if let Ok(SessionAccount {
                 account,
                 admin_access,
+                ..
             }) = api.get("/auth/me").await
             {
                 state.admin_access.set(admin_access);
@@ -152,9 +154,9 @@ fn App() -> Element {
                 },
                 Page::Account => rsx! { account::AccountScreen {} },
                 Page::Dashboard => match &account {
-                    Some(a) if a.has_role(Role::Vendor) => rsx! { vendor::VendorDashboard { vendor_id: a.id.clone() } },
-                    Some(a) if a.has_role(Role::Admin) && admin_access => rsx! { staff::AdminDashboard {} },
-                    Some(a) if a.has_role(Role::Rider) => rsx! { orders::OrderList { messages_only: false } },
+                    Some(a) if dashboard && a.has_role(Role::Vendor) => rsx! { vendor::VendorDashboard { vendor_id: a.id.clone() } },
+                    Some(a) if dashboard && a.has_role(Role::Admin) => rsx! { staff::AdminDashboard {} },
+                    Some(a) if dashboard && a.has_role(Role::Rider) => rsx! { orders::OrderList { messages_only: false } },
                     _ => rsx! { account::AccountScreen {} },
                 },
             }

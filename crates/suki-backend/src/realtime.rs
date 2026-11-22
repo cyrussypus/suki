@@ -388,9 +388,10 @@ pub async fn eta(
         return Err(ApiError::conflict("Rider location is stale"));
     }
     s.rate_limits.eta(&u.id)?;
+    let destination = order.destination(&s.field_cipher)?;
     let response = s.client.post(&s.maps_url).header("X-Goog-Api-Key", &s.maps_key)
         .header("X-Goog-FieldMask", "routes.distanceMeters,routes.duration")
-        .json(&json!({"origin":{"location":{"latLng":{"latitude":lat,"longitude":lng}}},"destination":{"location":{"latLng":{"latitude":order.lat,"longitude":order.lng}}},"travelMode":"DRIVE","routingPreference":"TRAFFIC_UNAWARE","computeAlternativeRoutes":false}))
+        .json(&json!({"origin":{"location":{"latLng":{"latitude":lat,"longitude":lng}}},"destination":{"location":{"latLng":{"latitude":destination.lat,"longitude":destination.lng}}},"travelMode":"DRIVE","routingPreference":"TRAFFIC_UNAWARE","computeAlternativeRoutes":false}))
         .send().await.map_err(|_| ApiError(StatusCode::BAD_GATEWAY, "Route service unavailable".into()))?;
     if !response.status().is_success() {
         return Err(ApiError(

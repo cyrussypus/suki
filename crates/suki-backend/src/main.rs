@@ -14,6 +14,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .map_err(|_| "Set SUKI_INTEGRITY_KEY before starting the API")?,
     )
     .map_err(|_| "SUKI_INTEGRITY_KEY must be 32 bytes encoded as 64 hex characters")?;
+    let field_cipher = Arc::new(suki_api::protected::FieldCipher::from_hex(
+        &std::env::var("DATA_ENCRYPTION_KEY")
+            .map_err(|_| "Set DATA_ENCRYPTION_KEY before starting the API")?,
+    )?);
     let admin_emails = match std::env::var("ADMIN_EMAILS") {
         Ok(value) => suki_api::auth::AdminEmails::parse(&value)?,
         Err(std::env::VarError::NotPresent) => suki_api::auth::AdminEmails::default(),
@@ -24,6 +28,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .connect(&std::env::var("DATABASE_URL")?)
         .await?;
     sqlx::migrate!("./migrations").run(&db).await?;
+    suki_api::protected::backfill(&db, &field_cipher)
+        .await
+        .map_err(|_| "Protected data migration or key validation failed")?;
     suki_api::auth::bootstrap(&db, &admin_emails).await?;
     let origin = std::env::var("APP_ORIGIN").unwrap_or_else(|_| "http://localhost:8080".into());
     let secure_cookies = std::env::var("COOKIE_SECURE")
@@ -37,6 +44,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         rate_limits: Default::default(),
         admin_emails,
         integrity_key,
+        field_cipher,
         client: reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(12))
             .build()?,

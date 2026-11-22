@@ -27,6 +27,10 @@ impl RateLimits {
         self.check(format!("rider:{}", crate::hash(token)), 120)
     }
 
+    pub fn admin(&self, user_id: &str) -> Result<()> {
+        self.check(format!("admin:{user_id}"), 10)
+    }
+
     pub fn eta(&self, user_id: &str) -> Result<()> {
         self.check(format!("eta:{user_id}"), 2)
     }

@@ -8,6 +8,7 @@ use axum::{
     http::{HeaderMap, header::SET_COOKIE, request::Parts},
     middleware::Next,
 };
+use suki_shared::auth::AccountStatus;
 pub use suki_shared::auth::{Account, Login, Registration};
 
 use suki_shared::auth::{
@@ -54,6 +55,7 @@ pub async fn require_admin_auth(
     // authenticate checks the allowlist against the session owner's stored email.
     let user = authenticate(&s, request.headers()).await?;
     user.require(&[Role::Admin.as_str()])?;
+    s.rate_limits.admin(&user.id)?;
     request.extensions_mut().insert(user);
     Ok(next.run(request).await)
 }
@@ -155,24 +157,35 @@ pub async fn register(
     State(s): State<App>,
     Json(input): Json<Registration>,
 ) -> Result<Json<RegistrationResult>> {
-    if input.role != "customer" && input.role != "vendor" {
-        return Err(ApiError::bad("Registration supports customers and vendors"));
-    }
+    let role = match input.role.as_str() {
+        "customer" => Role::Customer,
+        "vendor" => Role::Vendor,
+        "courier" | "rider" => Role::Rider,
+        _ => {
+            return Err(ApiError::bad(
+                "Registration supports customers, vendors and riders",
+            ));
+        }
+    };
     let name = text(&input.name, 2, 100)?;
     let email = email(&input.email)?;
     let phone = text(&input.phone, 7, 30)?;
     text(&input.password, PASSWORD_MIN_BYTES, PASSWORD_MAX_BYTES)?;
     throttle(&s, &hash(&format!("register:{email}"))).await?;
-    let shop = if input.role == "vendor" {
+    let shop = if role == Role::Vendor {
         Some(text(input.shop_name.as_deref().unwrap_or(""), 2, 120)?)
     } else {
         None
     };
     let password = password_hash(input.password).await?;
     let user_id = id();
-    let status = if shop.is_some() { "pending" } else { "active" };
+    let status = match role {
+        Role::Customer => AccountStatus::Active,
+        _ => AccountStatus::PendingApproval,
+    }
+    .as_str();
     let mut tx = s.db.begin().await?;
-    sqlx::query("INSERT INTO users(id,name,email,phone,password_hash,role,status,created_at) VALUES(?,?,?,?,?,?,?,?)").bind(&user_id).bind(name).bind(email).bind(phone).bind(password).bind(&input.role).bind(status).bind(now()).execute(&mut *tx).await?;
+    sqlx::query("INSERT INTO users(id,name,email,phone,password_hash,role,status,created_at) VALUES(?,?,?,?,?,?,?,?)").bind(&user_id).bind(name).bind(email).bind(phone).bind(password).bind(role.as_str()).bind(status).bind(now()).execute(&mut *tx).await?;
     if let Some(shop) = shop {
         sqlx::query("INSERT INTO vendor_profiles(user_id,shop_name) VALUES (?,?)")
             .bind(&user_id)
@@ -230,10 +243,21 @@ pub async fn login(State(s): State<App>, Json(input): Json<Login>) -> Result<imp
             "Invalid email or password".into(),
         ));
     };
-    if status != "active" {
+    if status == AccountStatus::PendingApproval.as_str() {
         return Err(ApiError(
             StatusCode::FORBIDDEN,
-            "Account is pending approval or inactive".into(),
+            "Account pending admin approval.".into(),
+        ));
+    }
+    if status != AccountStatus::Active.as_str() {
+        return Err(ApiError(
+            StatusCode::FORBIDDEN,
+            if status == AccountStatus::Rejected.as_str() {
+                "Account application was rejected."
+            } else {
+                "Account is inactive."
+            }
+            .into(),
         ));
     }
     s.admin_emails.check(&role, &stored_email)?;
@@ -270,11 +294,18 @@ pub async fn logout(State(s): State<App>, headers: HeaderMap) -> Result<impl Int
         Json(Acknowledged { ok: true }),
     ))
 }
-pub async fn me(user: User) -> Json<SessionAccount> {
-    Json(SessionAccount {
+pub async fn me(State(s): State<App>, user: User) -> Result<Json<SessionAccount>> {
+    let approved_at = sqlx::query_scalar(
+        "SELECT decided_at FROM onboarding_decisions WHERE user_id=? AND decision='active'",
+    )
+    .bind(&user.id)
+    .fetch_optional(&s.db)
+    .await?;
+    Ok(Json(SessionAccount {
         admin_access: user.has_role(Role::Admin),
         account: user.0,
-    })
+        approved_at,
+    }))
 }
 pub async fn bootstrap(
     db: &MySqlPool,

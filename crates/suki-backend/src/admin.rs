@@ -2,6 +2,7 @@ use crate::auth::User;
 use crate::*;
 use axum::extract::{Path, State};
 pub use suki_shared::admin::{AuditEntry, Expense, OrderReport, Reports, Settings, UserUpdate};
+use suki_shared::auth::AccountStatus;
 pub async fn load(db: &MySqlPool) -> Result<Settings> {
     Ok(sqlx::query_as("SELECT * FROM settings WHERE id=1")
         .fetch_one(db)
@@ -70,12 +71,21 @@ pub async fn update_user(
         ));
     }
     let mut tx = s.db.begin().await?;
-    let exists: Option<String> = sqlx::query_scalar("SELECT role FROM users WHERE id=? FOR UPDATE")
-        .bind(&uid)
-        .fetch_optional(&mut *tx)
-        .await?;
-    if exists.is_none() {
-        return Err(ApiError::bad("Account not found"));
+    let current: Option<String> =
+        sqlx::query_scalar("SELECT status FROM users WHERE id=? FOR UPDATE")
+            .bind(&uid)
+            .fetch_optional(&mut *tx)
+            .await?;
+    let current = current.ok_or_else(|| ApiError::bad("Account not found"))?;
+    if matches!(current.as_str(), "pending_approval" | "rejected") {
+        return Err(ApiError::conflict(
+            "Onboarding accounts require an approval decision",
+        ));
+    }
+    if v.status == "pending" && matches!(v.role.as_str(), "vendor" | "courier") {
+        return Err(ApiError::bad(
+            "Use onboarding to review vendor and rider applications",
+        ));
     }
     if v.role == "vendor" {
         let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM vendor_profiles WHERE user_id=?")
@@ -109,6 +119,74 @@ pub async fn update_user(
     tx.commit().await?;
     Ok(Json(Acknowledged { ok: true }))
 }
+pub async fn approve(
+    State(s): State<App>,
+    u: User,
+    Path(uid): Path<String>,
+) -> Result<Json<Acknowledged>> {
+    decide(&s, &u, &uid, AccountStatus::Active, "user.approve").await
+}
+
+pub async fn reject(
+    State(s): State<App>,
+    u: User,
+    Path(uid): Path<String>,
+) -> Result<Json<Acknowledged>> {
+    decide(&s, &u, &uid, AccountStatus::Rejected, "user.reject").await
+}
+
+async fn decide(
+    s: &App,
+    admin: &User,
+    uid: &str,
+    decision: AccountStatus,
+    action: &str,
+) -> Result<Json<Acknowledged>> {
+    admin.require(&["admin"])?;
+    let mut tx = s.db.begin().await?;
+    let account: Option<(String, String, String)> =
+        sqlx::query_as("SELECT id,role,status FROM users WHERE id=? FOR UPDATE")
+            .bind(uid)
+            .fetch_optional(&mut *tx)
+            .await?;
+    let (uid, role, status) =
+        account.ok_or(ApiError(StatusCode::NOT_FOUND, "Account not found".into()))?;
+    if !matches!(role.as_str(), "vendor" | "courier")
+        || status != AccountStatus::PendingApproval.as_str()
+    {
+        return Err(ApiError::conflict("Account is not pending onboarding"));
+    }
+    let decision = decision.as_str();
+    sqlx::query("UPDATE users SET status=? WHERE id=?")
+        .bind(decision)
+        .bind(&uid)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM sessions WHERE user_id=?")
+        .bind(&uid)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query(
+        "INSERT INTO onboarding_decisions(user_id,actor_id,decision,decided_at) VALUES (?,?,?,?)",
+    )
+    .bind(&uid)
+    .bind(&admin.id)
+    .bind(decision)
+    .bind(now())
+    .execute(&mut *tx)
+    .await?;
+    audit(
+        &mut tx,
+        &admin.id,
+        action,
+        &uid,
+        json!({"role":role,"status":decision}),
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(Json(Acknowledged { ok: true }))
+}
+
 pub async fn reports(State(s): State<App>, u: User) -> Result<Json<Reports>> {
     u.require(&["admin"])?;
     let counts: Vec<(String, i64)> =
@@ -121,13 +199,13 @@ pub async fn reports(State(s): State<App>, u: User) -> Result<Json<Reports>> {
             .fetch_all(&s.db)
             .await?;
     for oid in ids {
-        let (estimated,fee,final_goods):(i64,i64,Option<i64>)=sqlx::query_as("SELECT estimated_total_centavos,delivery_fee_centavos,final_goods_centavos FROM orders WHERE id=?").bind(&oid).fetch_one(&s.db).await?;
+        let (encrypted,fee,final_goods):(Vec<u8>,i64,Option<i64>)=sqlx::query_as("SELECT total_amount_centavos_encrypted,delivery_fee_centavos,final_goods_centavos FROM orders WHERE id=?").bind(&oid).fetch_one(&s.db).await?;
         let received:i64=sqlx::query_scalar("SELECT CAST(COALESCE(SUM(received_amount_centavos),0) AS SIGNED) FROM payments WHERE order_id=? AND status='paid'").bind(&oid).fetch_one(&s.db).await?;
         let refunds:i64=sqlx::query_scalar("SELECT CAST(COALESCE(SUM(amount_centavos),0) AS SIGNED) FROM refunds WHERE order_id=? AND status='processed'").bind(&oid).fetch_one(&s.db).await?;
         let expenses:i64=sqlx::query_scalar("SELECT CAST(COALESCE(SUM(amount_centavos),0) AS SIGNED) FROM expenses WHERE order_id=?").bind(&oid).fetch_one(&s.db).await?;
         reports.push(OrderReport {
+            estimated_total_centavos: s.field_cipher.decode("orders.total", &oid, &encrypted)?,
             order_id: oid,
-            estimated_total_centavos: estimated,
             received_centavos: received,
             delivery_fee_centavos: fee,
             purchase_cost_centavos: final_goods,
