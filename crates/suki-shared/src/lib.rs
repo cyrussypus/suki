@@ -8,6 +8,7 @@ pub mod orders;
 pub mod payments;
 pub mod pricing;
 pub mod realtime;
+pub mod reviews;
 pub mod snapshots;
 pub mod vendors;
 

@@ -5,6 +5,7 @@ mod gps;
 mod market;
 mod orders;
 mod staff;
+mod tracking;
 mod vendor;
 
 use api::Api;
@@ -114,6 +115,8 @@ fn App() -> Element {
     let vendor = account.as_ref().is_some_and(|a| a.has_role(Role::Vendor));
     rsx! {
         document::Title { "Suki Davao" }
+        document::Link { rel: "stylesheet", href: asset!("/assets/leaflet/leaflet.css") }
+        document::Script { src: asset!("/assets/leaflet/leaflet.js") }
         document::Link { rel: "icon", r#type: "image/png", href: asset!("/assets/suki-icon.png") }
         style { {include_str!("style.css")} }
         header {

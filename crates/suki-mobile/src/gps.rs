@@ -31,6 +31,9 @@ impl Source {
                     let _ = sender.send(Ok(Position {
                         lat: coords.latitude(),
                         lng: coords.longitude(),
+                        heading: coords.heading(),
+                        speed: coords.speed(),
+                        observed_at: Some((value.timestamp() / 1000.0) as i64),
                     }));
                 }
             })
@@ -292,6 +295,17 @@ mod android {
         Ok(Some(Position {
             lat: env.call_method(location, "getLatitude", "()D", &[])?.d()?,
             lng: env.call_method(location, "getLongitude", "()D", &[])?.d()?,
+            heading: if env.call_method(location, "hasBearing", "()Z", &[])?.z()? {
+                Some(env.call_method(location, "getBearing", "()F", &[])?.f()? as f64)
+            } else {
+                None
+            },
+            speed: if env.call_method(location, "hasSpeed", "()Z", &[])?.z()? {
+                Some(env.call_method(location, "getSpeed", "()F", &[])?.f()? as f64)
+            } else {
+                None
+            },
+            observed_at: Some(env.call_method(location, "getTime", "()J", &[])?.j()? / 1000),
         }))
     }
 }
@@ -340,6 +354,15 @@ mod ios {
             Ok(Position {
                 lat: point.latitude,
                 lng: point.longitude,
+                heading: {
+                    let value = unsafe { sample.course() };
+                    (value >= 0.0).then_some(value)
+                },
+                speed: {
+                    let value = unsafe { sample.speed() };
+                    (value >= 0.0).then_some(value)
+                },
+                observed_at: Some(unsafe { sample.timestamp() }.timeIntervalSince1970() as i64),
             })
         }
     }

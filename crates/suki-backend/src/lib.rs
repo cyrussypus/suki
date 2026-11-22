@@ -9,6 +9,7 @@ pub mod media;
 pub mod orders;
 pub mod payments;
 pub mod realtime;
+pub mod reviews;
 pub mod snapshots;
 pub mod storage;
 pub mod vendors;
@@ -250,6 +251,14 @@ pub fn router(s: App) -> Router {
             get(realtime::location).put(realtime::update_location),
         )
         .route("/api/orders/{id}/events", get(realtime::websocket))
+        .route(
+            "/api/rider/location/stream",
+            get(realtime::tracking_websocket),
+        )
+        .route("/api/orders/{id}/eta", get(realtime::eta))
+        .route("/api/orders/{id}/reviews", get(reviews::list))
+        .route("/api/orders/{id}/reviews/{kind}", post(reviews::submit))
+        .route("/api/reputation/{kind}/{id}", get(reviews::reputation))
         .nest(
             "/api/admin",
             Router::new()

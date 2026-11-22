@@ -8,6 +8,7 @@ publish = false
 [dependencies]
 dioxus = { version = "=0.7.10", default-features = false, features = ["minimal", "document", "asset"] }
 futures-util = { version = "0.3", features = ["sink"] }
+futures-channel = "0.3"
 serde.workspace = true
 serde_json.workspace = true
 suki-shared.workspace = true
@@ -18,13 +19,12 @@ time = { version = "0.3", features = ["formatting", "macros"] }
 reqwest = { version = "0.13.5", default-features = false, features = ["rustls", "json", "cookies", "multipart"] }
 rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
 webpki-roots = "1"
-tokio = { version = "1", features = ["rt-multi-thread", "time", "net"] }
+tokio = { version = "1", features = ["rt-multi-thread", "time", "net", "macros"] }
 tokio-tungstenite = { version = "0.29", features = ["rustls-tls-webpki-roots"] }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 gloo-net = { version = "0.7", features = ["websocket"] }
 gloo-timers = { version = "0.3", features = ["futures"] }
-futures-channel = "0.3"
 wasm-bindgen = "0.2"
 js-sys = "0.3"
 reqwest = { version = "0.13.5", default-features = false, features = ["json", "multipart"] }
