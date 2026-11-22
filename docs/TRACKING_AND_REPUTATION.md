@@ -1,4 +1,3 @@
-<!-- coderabbit-ai-generated:v1 -->
 
 # Delivery tracking and reputation
 

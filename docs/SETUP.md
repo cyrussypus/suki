@@ -24,9 +24,7 @@ cargo run --locked
 The API applies migrations before listening. Check `curl --fail http://localhost:8080/api/health`. From the workspace root use `cargo run --locked -p suki-backend` with variables supplied by the shell or your process manager. The sample environment describes administrator bootstrap. Remove bootstrap credentials after first startup.
 
 
-<!-- coderabbit-ai-generated:v1 -->
 
-<!-- coderabbit-ai-generated-section:v1:8630420614d94f7a001d11f5077a57f5956d0e846ff5a5a427604191af799980 -->
 
 Set `SUKI_INTEGRITY_KEY` before starting or upgrading the API. Generate it once with `openssl rand -hex 32`, keep it in your server secret store and back it up separately from MariaDB. All API instances must use the same key. Replacing it without a migration makes existing signatures fail verification. The migration requires permission to create triggers. Apply schema upgrades with older API instances stopped.
 
@@ -55,7 +53,6 @@ SHOW TRIGGERS;
 
 Restore the pre-upgrade backup into a fresh database, verify the restored migration records, and run the upgrade there with the original signing key and the configured data encryption key. Switch the API to that database only after the upgrade and health checks pass. Keep the failed database unchanged; if anything wrote to it after the backup, reconcile those writes before switching. Do not mark a partial migration successful or drop tables from the failed database to force a retry.
 
-<!-- /coderabbit-ai-generated:v1 -->
 
 
 Use **Order integrity inspector** on the admin dashboard to inspect a full order ID. The server verifies the transaction chain and stored chat signatures. An unsigned transaction entry indicates a write outside the API and blocks further changes through the API until investigated. Orders and chat created before the migration have no historical proof. The chain detects modification of signed entries and gaps before later entries; a privileged database restore or truncation requires an independent backup or checkpoint to detect. GCash fingerprints reject reuse of a normalized reference. Staff still confirm the transfer directly, as a fingerprint cannot prove receipt.
@@ -63,18 +60,13 @@ Use **Order integrity inspector** on the admin dashboard to inspect a full order
 New checkouts save one signed receipt in `order_snapshots` as part of the order transaction. The receipt locks the listing, vendor, weight, checkout price, payment method and quoted delivery charges. The customer and assigned rider can see this receipt; vendors can see only their own lines. The admin inspector checks the receipt against its signed audit entry. Orders placed before signed receipts were introduced retain their original checkout figures without a signature. The receipt always shows the checkout total. COD collection and vendor settlement continue to use the reconciled amounts displayed separately in the order.
 
 
-<!-- coderabbit-ai-generated:v1 -->
 
-<!-- coderabbit-ai-generated-section:v1:576fed61a34dc010af9a9154e8d67b889af471637aa382e7fc4ecf549775df5b -->
 
 The catalog starts empty. Register a vendor account, activate it in the admin dashboard, then sign in as the vendor and upload a product. Configure the R2 variables in the [backend guide](../crates/suki-backend/README.md) before uploading. Keep `SUKI_MEDIA_DIR` available and backed up for photos stored by earlier releases.
 
-<!-- /coderabbit-ai-generated:v1 -->
 
 
-<!-- coderabbit-ai-generated:v1 -->
 
-<!-- coderabbit-ai-generated-section:v1:abab93b4f2a56aa17ce36d34673108f56cbffdfc2fa3065c4766a5fa81e31d7d -->
 
 ## Remembered sessions and device unlock
 
@@ -86,7 +78,6 @@ Android and iOS remember the refresh credential in device-local secure storage. 
 
 ## Native mobile builds
 
-<!-- /coderabbit-ai-generated:v1 -->
 
 
 Run the following commands from the workspace root. Use Dioxus CLI 0.7.10 to match the application. Android requires JDK 17, SDK platform 35, build-tools 35.0.0 and NDK 27.2.12479018; set `ANDROID_HOME` and `NDK_HOME`. iOS requires macOS and Xcode. Device builds need your signing configuration.

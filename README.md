@@ -18,11 +18,8 @@ cargo test --locked
 cargo test --locked -- --include-ignored
 ```
 
-Suki has separate customer, vendor, rider, and admin dashboards. Vendors build the catalog by uploading product photos and setting prices, weights, and availability. Customers choose direct GCash or cash on delivery. Orders from a single stall have private chat between the customer, vendor, and assigned rider. Checkout requires a Google Routes key. <!-- coderabbit-ai-generated:v1 -->
-
-<!-- coderabbit-ai-generated-section:v1:ae439d9399fb89a9f057de8f23ba692901c9ed6c0c90297f7f870595c85342a0 -->
+Suki has separate customer, vendor, rider, and admin dashboards. Vendors build the catalog by uploading product photos and setting prices, weights, and availability. Customers choose direct GCash or cash on delivery. Orders from a single stall have private chat between the customer, vendor, and assigned rider. Checkout requires a Google Routes key. 
 
 Android and iOS remember the account in platform secure storage, and web sessions use HttpOnly cookies. Favorites and baskets remain in memory.
 
-<!-- /coderabbit-ai-generated:v1 -->
 
