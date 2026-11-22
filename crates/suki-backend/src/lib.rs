@@ -4,11 +4,13 @@ pub mod auth;
 pub mod catalog;
 pub mod delivery;
 pub mod integrity;
+pub mod limits;
 pub mod media;
 pub mod orders;
 pub mod payments;
 pub mod realtime;
 pub mod snapshots;
+pub mod storage;
 pub mod vendors;
 
 use axum::{
@@ -32,6 +34,7 @@ use tokio::sync::broadcast;
 #[derive(Clone)]
 pub struct AppState {
     pub db: MySqlPool,
+    pub rate_limits: Arc<limits::RateLimits>,
     pub admin_emails: auth::AdminEmails,
     pub integrity_key: suki_shared::crypto::IntegrityKey,
     pub client: reqwest::Client,
@@ -41,6 +44,7 @@ pub struct AppState {
     pub maps_url: String,
     pub legacy_quotes: bool,
     pub media_dir: std::path::PathBuf,
+    pub r2: Option<storage::R2>,
     pub events: broadcast::Sender<(String, OrderEvent)>,
 }
 pub type App = Arc<AppState>;
@@ -263,14 +267,21 @@ pub fn router(s: App) -> Router {
         .route("/api/orders/{id}/expenses", post(admin::expense))
         .layer(DefaultBodyLimit::max(32 * 1024))
         .layer(tower_http::trace::TraceLayer::new_for_http())
+        .layer(middleware::from_fn_with_state(s.clone(), limits::enforce))
         .layer(middleware::from_fn_with_state(s.clone(), safety))
         .merge(
             Router::new()
+                .route(
+                    "/api/upload/avatar",
+                    get(media::get_avatar).post(media::avatar),
+                )
+                .route("/api/upload/products/{id}", post(media::upload_product))
                 .route("/api/vendor/goods", post(media::create))
                 .route("/api/vendor/goods/{id}", put(media::edit))
                 .layer(DefaultBodyLimit::max(
                     suki_shared::catalog::MAX_PHOTO_BYTES + 16 * 1024,
                 ))
+                .layer(middleware::from_fn_with_state(s.clone(), limits::enforce))
                 .layer(middleware::from_fn_with_state(s.clone(), safety)),
         )
         .route("/images/vendor/{name}", get(media::photo))

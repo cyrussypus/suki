@@ -17,7 +17,7 @@ async fn call(
     cookie: &str,
     body: Value,
 ) -> (StatusCode, Value, String) {
-    let req = Request::builder()
+    let mut req = Request::builder()
         .method(method)
         .uri(path)
         .header("content-type", "application/json")
@@ -30,6 +30,12 @@ async fn call(
             Body::from(body.to_string())
         })
         .unwrap();
+    static NEXT_IP: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
+    let ip = std::net::Ipv4Addr::from(NEXT_IP.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+    req.extensions_mut()
+        .insert(axum::extract::ConnectInfo(std::net::SocketAddr::from((
+            ip, 1234,
+        ))));
     let response = app.clone().oneshot(req).await.unwrap();
     let status = response.status();
     let cookie = response
@@ -115,9 +121,70 @@ async fn full_order_and_authorization() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let task = tokio::spawn(async { axum::serve(listener, fixture).await.unwrap() });
+    // A small S3 wire fixture keeps CI independent of external credentials. An
+    // optional endpoint allows the same flow to run against a local S3 emulator.
+    let objects = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::<
+        String,
+        Vec<u8>,
+    >::new()));
+    let storage_fixture = axum::Router::new().route(
+        "/{bucket}/{*key}",
+        axum::routing::any({
+            let objects = objects.clone();
+            move |axum::extract::Path((_bucket, key)): axum::extract::Path<(String, String)>,
+                  request: Request<Body>| {
+                let objects = objects.clone();
+                async move {
+                    assert!(
+                        request
+                            .headers()
+                            .get("authorization")
+                            .and_then(|v| v.to_str().ok())
+                            .is_some_and(|v| v.starts_with("AWS4-HMAC-SHA256"))
+                    );
+                    if request.method() == "PUT" {
+                        let body = request
+                            .into_body()
+                            .collect()
+                            .await
+                            .unwrap()
+                            .to_bytes()
+                            .to_vec();
+                        objects.lock().await.insert(key, body);
+                        (StatusCode::OK, Vec::new())
+                    } else if request.method() == "GET" {
+                        match objects.lock().await.get(&key).cloned() {
+                            Some(body) => (StatusCode::OK, body),
+                            None => (StatusCode::NOT_FOUND, Vec::new()),
+                        }
+                    } else {
+                        (StatusCode::METHOD_NOT_ALLOWED, Vec::new())
+                    }
+                }
+            }
+        }),
+    );
+    let storage_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let storage_address = storage_listener.local_addr().unwrap();
+    let storage_task = tokio::spawn(async move {
+        axum::serve(storage_listener, storage_fixture)
+            .await
+            .unwrap()
+    });
+    let endpoint =
+        std::env::var("TEST_R2_ENDPOINT").unwrap_or_else(|_| format!("http://{storage_address}"));
+    let r2 = suki_api::storage::R2::new(
+        &endpoint,
+        "emulate-default",
+        &"https://media.example.invalid".parse().unwrap(),
+        "AKIAIOSFODNN7EXAMPLE",
+        "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+    )
+    .unwrap();
     let admin_email = format!("{}@test.invalid", id());
     let s: App = Arc::new(AppState {
         db: db.clone(),
+        rate_limits: Default::default(),
         admin_emails: suki_api::auth::AdminEmails::parse(&format!(
             "  {}  , second@test.invalid",
             admin_email.to_uppercase()
@@ -130,6 +197,7 @@ async fn full_order_and_authorization() {
         maps_key: "synthetic-test-key".into(),
         maps_url: format!("http://{address}/route"),
         legacy_quotes: true,
+        r2: Some(r2),
         media_dir: std::env::temp_dir().join(format!("suki-media-{}", id())),
         events: tokio::sync::broadcast::channel(256).0,
     });
@@ -138,7 +206,7 @@ async fn full_order_and_authorization() {
     let phc = suki_api::auth::password_hash("Synthetic-test-password-42".into())
         .await
         .unwrap();
-    sqlx::query("INSERT INTO users VALUES (?,?,?,'',?,'admin','active',?)")
+    sqlx::query("INSERT INTO users (id,name,email,phone,password_hash,role,status,created_at) VALUES (?,?,?,'',?,'admin','active',?)")
         .bind(&uid)
         .bind("Test Admin")
         .bind(&admin_email)
@@ -362,12 +430,252 @@ async fn full_order_and_authorization() {
         false
     );
 
+    // Exercise limits through the middleware, including spoofed proxy headers.
+    let limited = suki_api::router(Arc::new(AppState {
+        rate_limits: Default::default(),
+        ..(*s).clone()
+    }));
+    let limited_call = |route: String, method: &'static str, cookie: String, ip: [u8; 4]| {
+        let app = limited.clone();
+        async move {
+            let mut request = Request::builder()
+                .uri(route)
+                .method(method)
+                .header("cookie", cookie)
+                .header("x-suki-request", "1")
+                .header("x-forwarded-for", "203.0.113.99")
+                .body(Body::empty())
+                .unwrap();
+            request.extensions_mut().insert(axum::extract::ConnectInfo(
+                std::net::SocketAddr::from((ip, 1234)),
+            ));
+            app.oneshot(request).await.unwrap().status()
+        }
+    };
+    for _ in 0..5 {
+        assert_eq!(
+            limited_call("/api/auth/me".into(), "GET", String::new(), [127, 0, 0, 8]).await,
+            StatusCode::UNAUTHORIZED
+        );
+    }
+    assert_eq!(
+        limited_call("/api/auth/me".into(), "GET", String::new(), [127, 0, 0, 8]).await,
+        StatusCode::TOO_MANY_REQUESTS
+    );
+    assert_eq!(
+        limited_call("/api/auth/me".into(), "GET", String::new(), [127, 0, 0, 9]).await,
+        StatusCode::UNAUTHORIZED
+    );
+    for _ in 0..10 {
+        assert_ne!(
+            limited_call(
+                "/api/upload/avatar".into(),
+                "POST",
+                customer.clone(),
+                [127, 0, 0, 8]
+            )
+            .await,
+            StatusCode::TOO_MANY_REQUESTS
+        );
+    }
+    assert_eq!(
+        limited_call(
+            "/api/upload/avatar".into(),
+            "POST",
+            customer.clone(),
+            [127, 0, 0, 8]
+        )
+        .await,
+        StatusCode::TOO_MANY_REQUESTS
+    );
+    let second_customer_session = login(&app, &customer_email).await;
+    assert_eq!(
+        limited_call(
+            "/api/upload/avatar".into(),
+            "POST",
+            second_customer_session,
+            [127, 0, 0, 9]
+        )
+        .await,
+        StatusCode::TOO_MANY_REQUESTS
+    );
+    assert_ne!(
+        limited_call(
+            "/api/upload/avatar".into(),
+            "POST",
+            vendor.clone(),
+            [127, 0, 0, 8]
+        )
+        .await,
+        StatusCode::TOO_MANY_REQUESTS
+    );
+    for _ in 0..120 {
+        assert_ne!(
+            limited_call(
+                "/api/orders/missing/location".into(),
+                "PUT",
+                courier.clone(),
+                [127, 0, 0, 8]
+            )
+            .await,
+            StatusCode::TOO_MANY_REQUESTS
+        );
+    }
+    assert_eq!(
+        limited_call(
+            "/api/orders/missing/location".into(),
+            "PUT",
+            courier.clone(),
+            [127, 0, 0, 8]
+        )
+        .await,
+        StatusCode::TOO_MANY_REQUESTS
+    );
+
+    let second_courier_session = login(&app, &courier_email).await;
+    assert_ne!(
+        limited_call(
+            "/api/orders/missing/location".into(),
+            "PUT",
+            second_courier_session,
+            [127, 0, 0, 8]
+        )
+        .await,
+        StatusCode::TOO_MANY_REQUESTS
+    );
+
+    // Authenticated photo uploads are bound to the session identity and product owner.
+    let upload_photo = |route: String, cookie: String, bytes: Vec<u8>| {
+        let app = app.clone();
+        async move {
+            let boundary = "avatar-fixture";
+            let mut body = format!("--{boundary}\r\nContent-Disposition: form-data; name=\"photo\"; filename=\"photo.png\"\r\nContent-Type: image/png\r\n\r\n").into_bytes();
+            body.extend(bytes);
+            body.extend(format!("\r\n--{boundary}--\r\n").bytes());
+            app.oneshot(
+                Request::post(route)
+                    .header("cookie", cookie)
+                    .header("x-suki-request", "1")
+                    .header(
+                        "content-type",
+                        format!("multipart/form-data; boundary={boundary}"),
+                    )
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+        }
+    };
+    let mut png = std::io::Cursor::new(Vec::new());
+    image::RgbImage::from_pixel(3, 2, image::Rgb([1, 2, 3]))
+        .write_to(&mut png, image::ImageFormat::Png)
+        .unwrap();
+    let png = png.into_inner();
+    for cookie in [&customer, &vendor, &courier] {
+        let response = upload_photo("/api/upload/avatar".into(), cookie.clone(), png.clone()).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let result: Value =
+            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        let path = result["image"].as_str().unwrap();
+        let photo = app
+            .clone()
+            .oneshot(Request::get(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(photo.status(), StatusCode::OK);
+        assert_eq!(photo.headers()["content-type"], "image/jpeg");
+        assert_eq!(
+            ok(&app, "GET", "/api/upload/avatar", cookie, Value::Null).await["image"],
+            path
+        );
+    }
+    for cookie in [&customer, &courier, &vendor2] {
+        let response = upload_photo(
+            format!("/api/upload/products/{pid}"),
+            cookie.clone(),
+            png.clone(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+    let mut webp = std::io::Cursor::new(Vec::new());
+    image::RgbImage::from_pixel(2, 2, image::Rgb([70, 90, 10]))
+        .write_to(&mut webp, image::ImageFormat::WebP)
+        .unwrap();
+    let webp = upload_photo(
+        "/api/upload/avatar".into(),
+        customer.clone(),
+        webp.into_inner(),
+    )
+    .await;
+    assert_eq!(webp.status(), StatusCode::OK);
+    let invalid = upload_photo(
+        "/api/upload/avatar".into(),
+        customer.clone(),
+        b"not an image".to_vec(),
+    )
+    .await;
+    assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
+    let oversized = upload_photo(
+        "/api/upload/avatar".into(),
+        customer.clone(),
+        vec![0; 5 * 1024 * 1024 + 1],
+    )
+    .await;
+    assert_eq!(oversized.status(), StatusCode::BAD_REQUEST);
+    let product_photo = upload_photo(
+        format!("/api/upload/products/{pid}"),
+        vendor.clone(),
+        png.clone(),
+    )
+    .await;
+    assert_eq!(product_photo.status(), StatusCode::OK);
+    let image_url: Option<String> = sqlx::query_scalar("SELECT image_url FROM products WHERE id=?")
+        .bind(pid)
+        .fetch_one(&db)
+        .await
+        .unwrap();
+    assert!(
+        image_url
+            .as_deref()
+            .unwrap()
+            .starts_with("https://media.example.invalid/images/")
+    );
+
+    let listing = ok(&app, "GET", "/api/products", "", Value::Null).await;
+    let listed = listing
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["id"] == pid)
+        .unwrap();
+    assert_eq!(listed["image_url"], image_url.unwrap());
+    let mut update = product(16000);
+    update["image"] = listed["image"].clone();
+    ok(
+        &app,
+        "PUT",
+        &format!("/api/products/{pid}"),
+        &vendor,
+        update,
+    )
+    .await;
+    let kept: Option<String> = sqlx::query_scalar("SELECT image_url FROM products WHERE id=?")
+        .bind(pid)
+        .fetch_one(&db)
+        .await
+        .unwrap();
+    assert!(kept.is_some());
+
     let mut settings = ok(&app, "GET", "/api/settings", "", Value::Null).await;
     settings["gcash_qr_url"] = json!("/images/synthetic-test-qr.png");
     ok(&app, "PUT", "/api/settings", &admin, settings).await;
     let unavailable: App = Arc::new(AppState {
         admin_emails: s.admin_emails.clone(),
         db: db.clone(),
+        rate_limits: Default::default(),
         integrity_key: s.integrity_key.clone(),
         client: reqwest::Client::new(),
         secure_cookies: false,
@@ -375,6 +683,7 @@ async fn full_order_and_authorization() {
         maps_key: String::new(),
         maps_url: "http://127.0.0.1:1".into(),
         legacy_quotes: true,
+        r2: None,
         media_dir: std::env::temp_dir().join(format!("suki-media-{}", id())),
         events: tokio::sync::broadcast::channel(4).0,
     });
@@ -980,6 +1289,7 @@ async fn full_order_and_authorization() {
             .any(|r| r["action"] == "payment.verify")
     );
     live_task.abort();
+    storage_task.abort();
     task.abort();
     db.close().await;
 }
@@ -1039,11 +1349,21 @@ async fn marketplace_workflow(
     let decoded = image::load_from_memory(&bytes).unwrap();
     assert_eq!((decoded.width(), decoded.height()), (3, 2));
     assert!(
-        state
+        !state
             .media_dir
             .join(path.strip_prefix("/images/vendor/").unwrap())
-            .is_file()
+            .exists()
     );
+    let (image_url, owner, product_id): (String, String, i64) = sqlx::query_as("SELECT m.public_url,m.owner_id,m.product_id FROM media_objects m JOIN products p ON p.image_url=m.public_url WHERE p.id=?")
+        .bind(pid).fetch_one(&state.db).await.unwrap();
+    assert!(image_url.starts_with("https://media.example.invalid/images/"));
+    assert_eq!(product_id, pid);
+    let vendor_id: String = sqlx::query_scalar("SELECT vendor_id FROM products WHERE id=?")
+        .bind(pid)
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
+    assert_eq!(owner, vendor_id);
 
     let price_path = format!("/api/vendor/goods/{pid}/price");
     assert_eq!(
@@ -1572,5 +1892,7 @@ async fn marketplace_workflow(
         after["first_invalid_transaction"]
     );
 
-    tokio::fs::remove_dir_all(&state.media_dir).await.unwrap();
+    if state.media_dir.exists() {
+        tokio::fs::remove_dir_all(&state.media_dir).await.unwrap();
+    }
 }

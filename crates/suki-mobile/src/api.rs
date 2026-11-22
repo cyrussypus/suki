@@ -95,6 +95,23 @@ impl Api {
         })
     }
 
+    /// R2 URLs are supplied by the server, never by product form inputs.
+    pub fn product_image(&self, product: &suki_shared::catalog::Product) -> Option<String> {
+        product
+            .image_url
+            .as_deref()
+            .and_then(|url| {
+                let parsed = Url::parse(url).ok()?;
+                (parsed.scheme() == "https"
+                    && parsed.host_str().is_some()
+                    && parsed.username().is_empty()
+                    && parsed.password().is_none()
+                    && parsed.fragment().is_none())
+                .then(|| parsed.to_string())
+            })
+            .or_else(|| self.image(&product.image))
+    }
+
     pub fn image(&self, path: &str) -> Option<String> {
         if !path.starts_with("/images/") || path.contains("..") || path.contains('\\') {
             return None;
@@ -168,6 +185,28 @@ impl Api {
         Self::execute(
             self.client
                 .request(method, url)
+                .header("X-Suki-Request", "1")
+                .timeout(std::time::Duration::from_secs(30))
+                .multipart(form),
+        )
+        .await
+    }
+
+    pub async fn upload_avatar(
+        &self,
+        photo: Vec<u8>,
+    ) -> Result<suki_shared::catalog::AvatarImage, Failure> {
+        let url = self
+            .origin
+            .join("/api/upload/avatar")
+            .expect("internal API path");
+        let form = reqwest::multipart::Form::new().part(
+            "photo",
+            reqwest::multipart::Part::bytes(photo).file_name("avatar"),
+        );
+        Self::execute(
+            self.client
+                .post(url)
                 .header("X-Suki-Request", "1")
                 .timeout(std::time::Duration::from_secs(30))
                 .multipart(form),

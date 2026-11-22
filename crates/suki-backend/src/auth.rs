@@ -295,7 +295,7 @@ pub async fn bootstrap(
             let phc = password_hash(pass)
                 .await
                 .map_err(|_| "Password hash failed")?;
-            sqlx::query("INSERT INTO users VALUES (?,?,?,?,?,'admin','active',?)")
+            sqlx::query("INSERT INTO users (id,name,email,phone,password_hash,role,status,created_at) VALUES (?,?,?,?,?,'admin','active',?)")
                 .bind(id())
                 .bind("Suki Administrator")
                 .bind(address)

@@ -20,14 +20,55 @@ pub fn AccountScreen() -> Element {
     let mut phone = use_signal(String::new);
     let mut shop = use_signal(String::new);
     let mut error = use_signal(String::new);
+    let mut avatar = use_signal(|| None::<String>);
+    use_effect({
+        let api = api.clone();
+        move || {
+            let api = api.clone();
+            if (state.account)().is_some() {
+                spawn(async move {
+                    if let Ok(image) = api
+                        .get::<suki_shared::catalog::AvatarImage>("/upload/avatar")
+                        .await
+                    {
+                        avatar.set(image.image);
+                    }
+                });
+            } else {
+                avatar.set(None);
+            }
+        }
+    });
     if let Some(account) = (state.account)() {
+        let avatar_api = api.clone();
         return rsx! {
             section { class: "account-page",
                 p { class: "eyebrow", "GOOD TO SEE YOU" }
                 h1 { "Your account" }
                 div { class: "profile-card",
-                    span { class: "profile-avatar", "✳" }
+                    span { class: "profile-avatar",
+                        if let Some(image) = (avatar)().as_deref().and_then(|path| api.image(path)) { img { src: "{image}", alt: "Profile photo" } } else { "✳" }
+                    }
                     div { h2 { "{account.name}" } p { "{account.email}" } small { "{account.role}" } }
+                }
+                label { class: "avatar-upload", "Change profile photo"
+                    input { r#type: "file", accept: "image/jpeg,image/png,image/webp", disabled: busy(), onchange: move |e| {
+                        let Some(file) = e.files().into_iter().next() else { return; };
+                        if file.size() > suki_shared::catalog::MAX_PHOTO_BYTES as u64 { error.set("Photo exceeds 5 MiB.".into()); return; }
+                        let api = avatar_api.clone();
+                        busy.set(true);
+                        error.set(String::new());
+                        spawn(async move {
+                            match file.read_bytes().await {
+                                Ok(bytes) => match api.upload_avatar(bytes.to_vec()).await {
+                                    Ok(image) => avatar.set(image.image),
+                                    Err(failure) => error.set(failure.to_string()),
+                                },
+                                Err(_) => error.set("Unable to read photo.".into()),
+                            }
+                            busy.set(false);
+                        });
+                    } }
                 }
                 div { class: "account-menu",
                     if account.has_role(Role::Customer) {

@@ -128,7 +128,7 @@ fn ProductCard(product: Product) -> Element {
     let price = product.price_centavos;
     let favorites = state.favorites.read();
     let favorite = favorites.contains(&id);
-    let photo = api.image(&product.image);
+    let photo = api.product_image(&product);
     rsx! {
         article { class: "product-card",
             div { class: "product-photo",

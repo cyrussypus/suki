@@ -34,6 +34,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let s = Arc::new(AppState {
         db,
+        rate_limits: Default::default(),
         admin_emails,
         integrity_key,
         client: reqwest::Client::builder()
@@ -44,6 +45,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         maps_key: std::env::var("GOOGLE_MAPS_API_KEY").unwrap_or_default(),
         maps_url: std::env::var("GOOGLE_ROUTES_URL")
             .unwrap_or_else(|_| "https://routes.googleapis.com/directions/v2:computeRoutes".into()),
+        r2: suki_api::storage::R2::from_env()?,
         legacy_quotes: std::env::var("SUKI_ALLOW_LEGACY_QUOTES").as_deref() == Ok("true"),
         media_dir: std::env::var_os("SUKI_MEDIA_DIR")
             .map(std::path::PathBuf::from)
@@ -62,10 +64,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(preview) = std::env::var_os("SUKI_PREVIEW_DIR") {
         app = app.fallback_service(tower_http::services::ServeDir::new(preview));
     }
-    axum::serve(listener, app)
-        .with_graceful_shutdown(async {
-            tokio::signal::ctrl_c().await.ok();
-        })
-        .await?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .with_graceful_shutdown(async {
+        tokio::signal::ctrl_c().await.ok();
+    })
+    .await?;
     Ok(())
 }
