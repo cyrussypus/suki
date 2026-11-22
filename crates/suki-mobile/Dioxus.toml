@@ -17,4 +17,5 @@ compile_sdk = 35
 uses_cleartext_traffic = false
 
 [permissions]
+biometrics = { description = "Unlock your remembered Suki session and confirm sensitive actions." }
 location = { precision = "fine", description = "Share your location with the customer during an active delivery." }

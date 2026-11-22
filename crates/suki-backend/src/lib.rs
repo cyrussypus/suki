@@ -11,6 +11,7 @@ pub mod payments;
 pub mod protected;
 pub mod realtime;
 pub mod reviews;
+pub mod sessions;
 pub mod snapshots;
 pub mod storage;
 pub mod vendors;
@@ -36,6 +37,7 @@ use tokio::sync::broadcast;
 #[derive(Clone)]
 pub struct AppState {
     pub db: MySqlPool,
+    pub session_key: Arc<sessions::SessionKey>,
     pub rate_limits: Arc<limits::RateLimits>,
     pub admin_emails: auth::AdminEmails,
     pub field_cipher: Arc<protected::FieldCipher>,
@@ -201,8 +203,14 @@ pub fn router(s: App) -> Router {
         )
         .route("/api/auth/register", post(auth::register))
         .route("/api/auth/login", post(auth::login))
-        .route("/api/auth/logout", post(auth::logout))
+        .route("/api/auth/logout", post(sessions::logout))
         .route("/api/auth/me", get(auth::me))
+        .route("/api/auth/refresh", post(sessions::refresh))
+        .route("/api/auth/sessions", get(sessions::list))
+        .route(
+            "/api/auth/sessions/{id}",
+            axum::routing::delete(sessions::revoke),
+        )
         .route("/api/products", get(catalog::list).post(catalog::create))
         .route("/api/products/{id}", put(catalog::update))
         .route(

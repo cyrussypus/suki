@@ -40,13 +40,11 @@ async fn call(
     let status = response.status();
     let cookie = response
         .headers()
-        .get("set-cookie")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .split(';')
-        .next()
-        .unwrap_or("")
-        .to_string();
+        .get_all("set-cookie")
+        .iter()
+        .filter_map(|v| v.to_str().ok()?.split(';').next())
+        .collect::<Vec<_>>()
+        .join("; ");
     let bytes = response.into_body().collect().await.unwrap().to_bytes();
     let value = serde_json::from_slice(&bytes)
         .unwrap_or_else(|_| json!({"raw":String::from_utf8_lossy(&bytes)}));
@@ -97,6 +95,159 @@ async fn quote(app: &axum::Router, cookie: &str) -> Value {
         json!({"address":"123 Synthetic Street, Matina, Davao City","lat":7.05,"lng":125.59}),
     )
     .await
+}
+
+async fn device_sessions(
+    app: &axum::Router,
+    state: &AppState,
+    owner: &str,
+    email: &str,
+    stranger: &str,
+) {
+    use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+    let pos = owner
+        .split(';')
+        .find_map(|v| v.trim().strip_prefix("suki_session="))
+        .unwrap();
+    let payload = URL_SAFE_NO_PAD
+        .decode(pos.split('.').nth(1).unwrap())
+        .unwrap();
+    let claims: Value = serde_json::from_slice(&payload).unwrap();
+    assert_eq!(
+        claims["exp"].as_i64().unwrap() - claims["iat"].as_i64().unwrap(),
+        900
+    );
+
+    let refresh_only = |cookie: &str| {
+        cookie
+            .split(';')
+            .find(|v| v.trim().starts_with("suki_refresh="))
+            .unwrap()
+            .trim()
+            .to_owned()
+    };
+    let tablet = login(app, email).await;
+    let old = refresh_only(&tablet);
+    let listing = ok(app, "GET", "/api/auth/sessions", owner, Value::Null).await;
+    assert_eq!(listing.as_array().unwrap().len(), 2);
+    let other = listing
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["current"] == false)
+        .unwrap();
+    assert_eq!(
+        other["expires_at"].as_i64().unwrap() - other["created_at"].as_i64().unwrap(),
+        30 * 86_400
+    );
+    let id = other["id"].as_str().unwrap();
+    let path = format!("/api/auth/sessions/{id}");
+    assert_eq!(
+        call(app, "DELETE", &path, stranger, Value::Null).await.0,
+        404
+    );
+    let (status, _, rotated) = call(app, "POST", "/api/auth/refresh", &old, Value::Null).await;
+    assert_eq!(status, 200);
+    assert_ne!(refresh_only(&rotated), old);
+    assert_ne!(rotated.split(';').next(), tablet.split(';').next());
+    assert_eq!(
+        call(app, "POST", "/api/auth/refresh", &old, Value::Null)
+            .await
+            .0,
+        409
+    );
+    let raw = refresh_only(&rotated);
+    let stored: String =
+        sqlx::query_scalar("SELECT refresh_token_hash FROM user_sessions WHERE id=?")
+            .bind(id)
+            .fetch_one(&state.db)
+            .await
+            .unwrap();
+    assert_eq!(
+        stored,
+        suki_api::hash(raw.trim_start_matches("suki_refresh="))
+    );
+    sqlx::query("UPDATE spent_refresh_tokens SET used_at=? WHERE session_id=?")
+        .bind(now() - 10)
+        .bind(id)
+        .execute(&state.db)
+        .await
+        .unwrap();
+    assert_eq!(
+        call(app, "POST", "/api/auth/refresh", &old, Value::Null)
+            .await
+            .0,
+        401
+    );
+    assert_eq!(
+        call(app, "GET", "/api/auth/me", &rotated, Value::Null)
+            .await
+            .0,
+        401
+    );
+    assert_eq!(
+        call(app, "POST", "/api/auth/refresh", &raw, Value::Null)
+            .await
+            .0,
+        401
+    );
+    assert_eq!(
+        call(app, "GET", "/api/auth/me", owner, Value::Null).await.0,
+        200
+    );
+
+    let tablet = login(app, email).await;
+    let listing = ok(app, "GET", "/api/auth/sessions", owner, Value::Null).await;
+    let id = listing
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["current"] == false)
+        .unwrap()["id"]
+        .as_str()
+        .unwrap();
+    ok(
+        app,
+        "DELETE",
+        &format!("/api/auth/sessions/{id}"),
+        owner,
+        Value::Null,
+    )
+    .await;
+    assert_eq!(
+        call(app, "GET", "/api/auth/me", &tablet, Value::Null)
+            .await
+            .0,
+        401
+    );
+    assert_eq!(
+        call(
+            app,
+            "POST",
+            "/api/auth/refresh",
+            &refresh_only(&tablet),
+            Value::Null
+        )
+        .await
+        .0,
+        401
+    );
+
+    let tablet = login(app, email).await;
+    ok(
+        app,
+        "POST",
+        "/api/auth/logout",
+        &refresh_only(&tablet),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(
+        call(app, "GET", "/api/auth/me", &tablet, Value::Null)
+            .await
+            .0,
+        401
+    );
 }
 
 const LEGACY_ADDRESS: &str = "123 Synthetic Legacy Address, Davao City";
@@ -285,6 +436,7 @@ async fn full_order_and_authorization() {
         .unwrap(),
         integrity_key: signing,
         field_cipher: field_cipher.clone(),
+        session_key: Arc::new(suki_api::sessions::SessionKey::from_hex(&"21".repeat(32)).unwrap()),
         client: reqwest::Client::new(),
         secure_cookies: false,
         origin: "http://localhost:3000".into(),
@@ -363,6 +515,7 @@ async fn full_order_and_authorization() {
     let customer = login(&app, &customer_email).await;
     let (_, other_email) = account(&app, "customer").await;
     let other = login(&app, &other_email).await;
+    device_sessions(&app, &s, &customer, &customer_email, &other).await;
     let saved_address=ok(&app,"POST","/api/addresses",&customer,json!({"label":"Home","address":"123 Synthetic Address, Davao City","lat":7.05,"lng":125.59})).await;
     assert!(saved_address["id"].is_string());
     let protected: bool = sqlx::query_scalar("SELECT address IS NULL AND label IS NULL AND lat IS NULL AND lng IS NULL AND address_encrypted IS NOT NULL FROM customer_addresses WHERE id=?")
@@ -894,6 +1047,7 @@ async fn full_order_and_authorization() {
         rate_limits: Default::default(),
         integrity_key: s.integrity_key.clone(),
         field_cipher: field_cipher.clone(),
+        session_key: s.session_key.clone(),
         client: reqwest::Client::new(),
         secure_cookies: false,
         origin: "http://localhost:3000".into(),

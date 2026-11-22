@@ -6,6 +6,7 @@ mod market;
 mod orders;
 mod staff;
 mod tracking;
+mod vault;
 mod vendor;
 
 use api::Api;
@@ -33,6 +34,7 @@ struct State {
     account: Signal<Option<Account>>,
     admin_access: Signal<bool>,
     signing_out: Signal<bool>,
+    biometric_offer: Signal<bool>,
     catalog: Signal<Vec<Product>>,
     categories: Signal<Vec<String>>,
     settings: Signal<Option<Settings>>,
@@ -67,11 +69,13 @@ fn main() {
 #[component]
 fn App() -> Element {
     let api = use_hook(Api::new);
+    let mut restoring = use_signal(|| true);
     let mut state = State {
         page: use_signal(|| Page::Market),
         account: use_signal(|| None),
         admin_access: use_signal(|| false),
         signing_out: use_signal(|| false),
+        biometric_offer: use_signal(|| false),
         catalog: use_signal(Vec::new),
         categories: use_signal(Vec::new),
         settings: use_signal(|| None),
@@ -90,21 +94,29 @@ fn App() -> Element {
     use_future(move || {
         let api = api.clone();
         async move {
-            refresh_catalog(&api, state).await;
-            if let Ok(SessionAccount {
-                account,
-                admin_access,
-                ..
-            }) = api.get("/auth/me").await
-            {
-                state.admin_access.set(admin_access);
-                if (state.page)() == Page::Market {
+            match api.restore().await {
+                Ok(SessionAccount {
+                    account,
+                    admin_access,
+                    ..
+                }) => {
+                    state.admin_access.set(admin_access);
                     state.page.set(home_for(&account, admin_access));
+                    state.account.set(Some(account));
                 }
-                state.account.set(Some(account));
+                Err(reason) if crate::vault::NATIVE && reason.status != Some(401) => {
+                    state.notice.set(reason.to_string());
+                    state.page.set(Page::Account);
+                }
+                Err(_) => {}
             }
+            restoring.set(false);
+            refresh_catalog(&api, state).await;
         }
     });
+    if restoring() {
+        return rsx! { main { role: "status", "Opening Suki…" } };
+    }
     let page = (state.page)();
     let active = (state.active_order)();
     let basket_count = state.basket.read().len();
@@ -132,6 +144,9 @@ fn App() -> Element {
             }
         }
         main {
+            if crate::vault::NATIVE && (state.biometric_offer)() && account.is_some() {
+                account::BiometricOffer {}
+            }
             if !(state.notice)().is_empty() {
                 div { class: "notice global", role: "status",
                     span { "{state.notice}" }

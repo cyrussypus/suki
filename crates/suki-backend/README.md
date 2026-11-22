@@ -19,7 +19,13 @@ The client uses the server's `admin_access` flag from `GET /api/auth/me` to show
 <!-- /coderabbit-ai-generated:v1 -->
 
 - Argon2id password hashes; bounded password workers; per-identity authentication attempt limits.
-- Random opaque session cookies, HttpOnly, SameSite=Lax, optional development-only insecure mode. Only SHA-256 token hashes are stored. Sessions expire after seven days, logout removes them, and administrative account changes revoke them.
+<!-- coderabbit-ai-generated:v1 -->
+
+<!-- coderabbit-ai-generated-section:v1:53ec66bb8aff5cc9728dfef95eacffb18d90a92aa7ab73c0996f913c12f957f7 -->
+
+- Access JWTs expire after 15 minutes and use the independent `SESSION_SIGNING_KEY`. Each device session lasts up to 30 days and has a rotating opaque refresh credential stored only as a SHA-256 hash. Cookies are HttpOnly, SameSite=Lax and Secure outside localhost development. Requests check the MariaDB session and current account state. Logout, remote revocation and administrative account changes invalidate device sessions.
+
+<!-- /coderabbit-ai-generated:v1 -->
 - Mutating requests require `X-Suki-Request: 1`. Browser Origin must match the configured origin; no cross-origin CORS access is granted. WebSockets require an exact Origin and a session cookie.
 - SQL values are bound parameters. SQLx 0.9 additionally rejects dynamically composed unaudited query strings. HTTP bodies are limited to 32 KiB; messages and domain input have narrower limits.
 - Only customers can create their own orders, only vendors can modify their own products, and only order participants or administrators can read private order data. Vendors see only their own requested item lines, not customer addresses or payments.
@@ -36,11 +42,18 @@ Deploy one backend instance for the initial dedicated-courier MVP: broadcasts ar
 
 All paths begin `/api`. Authenticated calls use `suki_session`; mutations require the custom request header. Monetary JSON fields end in `_centavos`; timestamps are UTC Unix seconds. Error responses contain `{ "error": "..." }`. IDs are UUID strings except product/message IDs. Lists are bounded; order/admin listings are currently capped at 100/500 entries.
 
+<!-- coderabbit-ai-generated:v1 -->
+
+<!-- coderabbit-ai-generated-section:v1:48b2f3069c8750341f5c97cd881b537350dc4010d3988421a46611aa554a0baa -->
+
 | Method | Path | Access / body |
 | --- | --- | --- |
 | GET | `/health` | Database readiness |
 | POST | `/auth/register` | `{name,email,phone,password,role,shop_name?}`; role customer/vendor, password 12–128 bytes |
-| POST | `/auth/login` | `{email,password}`; sets session cookie |
+| POST | `/auth/login` | `{email,password}`; sets access and refresh cookies |
+| POST | `/auth/refresh` | Rotates the refresh cookie and issues a new access cookie |
+| GET | `/auth/sessions` | Lists the signed-in account’s active device sessions |
+| DELETE | `/auth/sessions/{id}` | Revokes an active device session owned by the signed-in account |
 | POST | `/auth/logout` | Deletes current session |
 | GET | `/auth/me` | Current account |
 | GET, POST | `/products` | Public read; vendor create `{name,local_name,description,category,unit,price_centavos,image,available}` |
@@ -71,6 +84,8 @@ All paths begin `/api`. Authenticated calls use `suki_session`; mutations requir
 | PATCH | `/admin/users/{id}` | Admin `{role,status}`; cannot change own access |
 | POST | `/orders/{id}/expenses` | Courier/admin `{amount_centavos,description}` |
 | GET | `/admin/reports`, `/admin/audit` | Admin profitability, status counts and audit entries |
+
+<!-- /coderabbit-ai-generated:v1 -->
 
 
 The owning vendor can change stock availability with `PATCH /api/products/{id}/availability` and `{available}`. This leaves other product fields unchanged.

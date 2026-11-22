@@ -104,6 +104,10 @@ pub async fn update_user(
         .bind(&uid)
         .execute(&mut *tx)
         .await?;
+    sqlx::query("DELETE FROM user_sessions WHERE user_id=?")
+        .bind(&uid)
+        .execute(&mut *tx)
+        .await?;
     sqlx::query("DELETE FROM sessions WHERE user_id=?")
         .bind(&uid)
         .execute(&mut *tx)
@@ -159,6 +163,10 @@ async fn decide(
     let decision = decision.as_str();
     sqlx::query("UPDATE users SET status=? WHERE id=?")
         .bind(decision)
+        .bind(&uid)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM user_sessions WHERE user_id=?")
         .bind(&uid)
         .execute(&mut *tx)
         .await?;

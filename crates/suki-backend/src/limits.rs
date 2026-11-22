@@ -23,8 +23,8 @@ impl RateLimits {
         self.check(format!("upload:{user_id}"), 10)
     }
 
-    pub fn rider(&self, token: &str) -> Result<()> {
-        self.check(format!("rider:{}", crate::hash(token)), 120)
+    pub fn rider(&self, session: &str) -> Result<()> {
+        self.check(format!("rider:{session}"), 120)
     }
 
     pub fn admin(&self, user_id: &str) -> Result<()> {
@@ -105,7 +105,7 @@ pub async fn enforce(State(s): State<App>, mut req: Request, next: Next) -> Resp
             }
             if rider_path && user.role == "courier" {
                 let token = auth::session_token(req.headers()).ok_or_else(ApiError::forbidden)?;
-                s.rate_limits.rider(token.secret())?;
+                s.rate_limits.rider(&auth::rider_session_key(&s, &token))?;
             }
             req.extensions_mut().insert(user);
         }

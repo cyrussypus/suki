@@ -18,6 +18,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         &std::env::var("DATA_ENCRYPTION_KEY")
             .map_err(|_| "Set DATA_ENCRYPTION_KEY before starting the API")?,
     )?);
+    let session_key = Arc::new(suki_api::sessions::SessionKey::from_hex(
+        &std::env::var("SESSION_SIGNING_KEY")
+            .map_err(|_| "Set SESSION_SIGNING_KEY before starting the API")?,
+    )?);
     let admin_emails = match std::env::var("ADMIN_EMAILS") {
         Ok(value) => suki_api::auth::AdminEmails::parse(&value)?,
         Err(std::env::VarError::NotPresent) => suki_api::auth::AdminEmails::default(),
@@ -42,6 +46,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let s = Arc::new(AppState {
         db,
         rate_limits: Default::default(),
+        session_key,
         admin_emails,
         integrity_key,
         field_cipher,

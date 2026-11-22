@@ -199,11 +199,16 @@ pub fn Basket() -> Element {
                                 }).collect(),
                             }
                         };
-                        state.pending.set(Some(request.clone()));
                         busy.set(true);
                         error.set(String::new());
                         let api = api.clone();
                         spawn(async move {
+                            if let Err(reason) = api.confirm_sensitive_action().await {
+                                error.set(reason.to_string());
+                                busy.set(false);
+                                return;
+                            }
+                            state.pending.set(Some(request.clone()));
                             match api.send::<CheckoutResult, _>(Method::POST, "/orders/checkout", &request).await {
                                 Ok(result) => {
                                     state.pending.set(None);

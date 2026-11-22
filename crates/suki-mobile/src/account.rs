@@ -4,7 +4,9 @@ use dioxus::prelude::*;
 use reqwest::Method;
 use suki_shared::{
     Acknowledged,
-    auth::{Account, AccountStatus, Login, Registration, RegistrationResult, Role, SessionAccount},
+    auth::{
+        AccountStatus, DeviceSession, Login, Registration, RegistrationResult, Role, SessionAccount,
+    },
 };
 
 #[component]
@@ -79,34 +81,26 @@ pub fn AccountScreen() -> Element {
                         button { onclick: move |_| state.page.set(Page::Dashboard), span { class: "menu-icon", "▦" } span { strong { "Dashboard" } small { "View your workspace" } } b { "›" } }
                     }
                 }
+                SessionSettings {}
                 if !(error)().is_empty() { p { role: "alert", "{error}" } }
                 button { class: "signout", disabled: (state.signing_out)(), onclick: move |_| {
                     if (state.signing_out)() { return; }
                     let api = api.clone();
                     state.signing_out.set(true);
                     spawn_forever(async move {
-                        let result = api.send::<Acknowledged, _>(Method::POST, "/auth/logout", &()).await;
-                        let revoked = match result {
-                            Ok(_) => true,
-                            Err(failure) => {
-                                match api.get::<Account>("/auth/me").await {
-                                    Err(probe) if probe.status == Some(401) => true,
-                                    _ => {
-                                        state.notice.set(failure.to_string());
-                                        false
-                                    }
-                                }
-                            }
-                        };
-                        if revoked {
+                        match api.logout().await {
+                            Ok(warning) => {
                             state.admin_access.set(false);
                             state.account.set(None);
+                            state.biometric_offer.set(false);
                             state.basket.write().clear();
                             state.favorites.write().clear();
                             state.active_order.set(None);
                             state.pending.set(None);
                             state.page.set(Page::Market);
-                            state.notice.set("Signed out.".into());
+                            state.notice.set(warning.unwrap_or_else(|| "Signed out.".into()));
+                            }
+                            Err(failure) => state.notice.set(failure.to_string()),
                         }
                         state.signing_out.set(false);
                     });
@@ -142,10 +136,12 @@ pub fn AccountScreen() -> Element {
                                 }
                                 register.set(false);
                             }
-                            api.send::<Acknowledged, _>(Method::POST, "/auth/login", &login).await?;
-                            let SessionAccount { account, admin_access, approved_at } = api.get("/auth/me").await?;
+                            let (SessionAccount { account, admin_access, approved_at }, storage_warning) = api.login(&login).await?;
+                            if crate::vault::NATIVE && storage_warning.is_none() && matches!(api.biometric_enabled().await, Ok(false)) {
+                                state.biometric_offer.set(true);
+                            }
                             state.admin_access.set(admin_access);
-                            state.notice.set(if approved_at.is_some() && matches!(account.role.as_str(), "vendor" | "courier") {
+                            state.notice.set(if let Some(warning) = storage_warning { warning } else if approved_at.is_some() && matches!(account.role.as_str(), "vendor" | "courier") {
                                 "Your application has been approved. Your dashboard is ready.".into()
                             } else {
                                 format!("Welcome, {}.", account.name)
@@ -190,6 +186,117 @@ pub fn AccountScreen() -> Element {
                     }
                 }
             }
+        }
+    }
+}
+
+#[component]
+fn SessionSettings() -> Element {
+    let api = use_context::<Api>();
+    let mut sessions = use_signal(|| None::<Vec<DeviceSession>>);
+    let mut busy = use_signal(|| false);
+    let mut biometric = use_signal(|| false);
+    let mut error = use_signal(String::new);
+    let probe = api.clone();
+    use_future(move || {
+        let api = probe.clone();
+        async move {
+            if crate::vault::NATIVE {
+                match api.biometric_enabled().await {
+                    Ok(enabled) => biometric.set(enabled),
+                    Err(failure) => error.set(failure.to_string()),
+                }
+            }
+        }
+    });
+    let toggle = api.clone();
+    let refresh = api.clone();
+    rsx! {
+        section { class: "panel", h2 { "Sign-in and devices" }
+            if crate::vault::NATIVE {
+                p { "Use your device’s fingerprint, Face ID, or screen lock to unlock Suki and confirm checkout or payment changes." }
+                button { r#type: "button", disabled: busy(), onclick: move |_| {
+                    let enable = !biometric();
+                    let api = toggle.clone();
+                    busy.set(true);
+                    error.set(String::new());
+                    spawn(async move {
+                        match api.set_biometrics(enable).await {
+                            Ok(()) => biometric.set(enable),
+                            Err(failure) => error.set(failure.to_string()),
+                        }
+                        busy.set(false);
+                    });
+                }, if biometric() { "Disable biometric login" } else { "Enable biometric login" } }
+            }
+            button { r#type: "button", disabled: busy(), onclick: move |_| {
+                let api = refresh.clone();
+                busy.set(true);
+                error.set(String::new());
+                spawn(async move {
+                    match api.get("/auth/sessions").await {
+                        Ok(data) => sessions.set(Some(data)),
+                        Err(failure) => error.set(failure.to_string()),
+                    }
+                    busy.set(false);
+                });
+            }, "View active devices" }
+            if let Some(rows) = sessions() {
+                if rows.is_empty() { p { "No active device sessions." } }
+                for session in rows {
+                    div { class: "line", key: "{session.id}",
+                        span { "{session.device_name}" if session.current { " · This device" } }
+                        if !session.current {
+                            button { r#type: "button", disabled: busy(), onclick: {
+                                let api = api.clone();
+                                let id = session.id.clone();
+                                move |_| {
+                                    let api = api.clone();
+                                    let id = id.clone();
+                                    busy.set(true);
+                                    error.set(String::new());
+                                    spawn(async move {
+                                        match api.send::<Acknowledged, _>(Method::DELETE, &format!("/auth/sessions/{id}"), &()).await {
+                                            Ok(_) => if let Some(entries) = sessions.write().as_mut() { entries.retain(|s| s.id != id); },
+                                            Err(failure) => error.set(failure.to_string()),
+                                        }
+                                        busy.set(false);
+                                    });
+                                }
+                            }, "Sign out device" }
+                        }
+                    }
+                }
+            }
+            if !error().is_empty() { p { role: "alert", "{error}" } }
+        }
+    }
+}
+
+#[component]
+pub fn BiometricOffer() -> Element {
+    let api = use_context::<Api>();
+    let mut state = use_context::<State>();
+    let mut busy = use_signal(|| false);
+    rsx! {
+        section { class: "notice", aria_label: "Biometric login",
+            p { "Use fingerprint or Face ID to unlock Suki next time?" }
+            button { r#type: "button", disabled: busy(), onclick: move |_| {
+                if busy() { return; }
+                busy.set(true);
+                let api = api.clone();
+                spawn(async move {
+                    match api.set_biometrics(true).await {
+                        Ok(()) => {
+                            state.biometric_offer.set(false);
+                            state.notice.set("Biometric login enabled.".into());
+                        }
+                        Err(error) => state.notice.set(error.to_string()),
+                    }
+                    busy.set(false);
+                });
+            }, "Enable biometric login" }
+            button { r#type: "button", disabled: busy(), onclick: move |_| state.biometric_offer.set(false), "Not now" }
         }
     }
 }

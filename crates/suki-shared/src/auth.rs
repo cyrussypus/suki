@@ -119,3 +119,17 @@ impl AccountStatus {
         }
     }
 }
+
+pub const REFRESH_COOKIE: &str = "suki_refresh";
+pub const ACCESS_SECONDS: i64 = 900;
+pub const REFRESH_SECONDS: i64 = 30 * 86_400;
+
+#[derive(Clone, Deserialize, Serialize)]
+pub struct DeviceSession {
+    pub id: String,
+    pub device_name: String,
+    pub created_at: i64,
+    pub last_used_at: i64,
+    pub expires_at: i64,
+    pub current: bool,
+}

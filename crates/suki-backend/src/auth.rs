@@ -5,7 +5,7 @@ use argon2::{
 };
 use axum::{
     extract::{FromRequestParts, Request, State},
-    http::{HeaderMap, header::SET_COOKIE, request::Parts},
+    http::{HeaderMap, request::Parts},
     middleware::Next,
 };
 use suki_shared::auth::AccountStatus;
@@ -13,7 +13,7 @@ pub use suki_shared::auth::{Account, Login, Registration};
 
 use suki_shared::auth::{
     ARGON2_ITERATIONS, ARGON2_LANES, ARGON2_MEMORY_KIB, PASSWORD_MAX_BYTES, PASSWORD_MIN_BYTES,
-    RegistrationResult, Role, SESSION_COOKIE, SESSION_SECONDS, SessionAccount, SessionToken,
+    RegistrationResult, Role, SESSION_COOKIE, SessionAccount, SessionToken,
 };
 
 #[derive(Clone, Default)]
@@ -36,7 +36,7 @@ impl AdminEmails {
         self.0.contains(&address.trim().to_lowercase())
     }
 
-    fn check(&self, role: &str, address: &str) -> Result<()> {
+    pub(crate) fn check(&self, role: &str, address: &str) -> Result<()> {
         if role == Role::Admin.as_str() && !self.contains(address) {
             return Err(ApiError::forbidden());
         }
@@ -87,20 +87,37 @@ impl FromRequestParts<App> for User {
     }
 }
 pub fn session_token(h: &HeaderMap) -> Option<SessionToken> {
-    h.get("cookie")?.to_str().ok()?.split(';').find_map(|s| {
-        s.trim()
-            .strip_prefix(SESSION_COOKIE)
-            .and_then(|s| s.strip_prefix('='))
-            .map(|value| SessionToken::new(value.to_owned()))
-    })
+    crate::sessions::cookie(h, SESSION_COOKIE).map(SessionToken::new)
 }
 pub async fn authenticate(s: &App, h: &HeaderMap) -> Result<User> {
     let token =
         session_token(h).ok_or(ApiError(StatusCode::UNAUTHORIZED, "Please sign in".into()))?;
-    let account = sqlx::query_as::<_,Account>("SELECT u.id,u.name,u.email,u.phone,u.role,u.status FROM users u JOIN sessions s ON s.user_id=u.id WHERE s.token_hash=? AND s.expires_at>? AND u.status='active'").bind(hash(token.secret())).bind(now()).fetch_optional(&s.db).await?.ok_or(ApiError(StatusCode::UNAUTHORIZED,"Session expired or account unavailable".into()))?;
+    authenticate_token(s, &token, false).await
+}
+
+// An established socket rechecks the revocable device session. Its handshake
+// still requires a fresh access token, just like any new authenticated request.
+pub(crate) async fn authenticate_token(
+    s: &App,
+    token: &SessionToken,
+    established_socket: bool,
+) -> Result<User> {
+    let account = if let Some(claims) = crate::sessions::check_jwt(s, token.secret(), established_socket) {
+        sqlx::query_as::<_, Account>("SELECT u.id,u.name,u.email,u.phone,u.role,u.status FROM users u JOIN user_sessions s ON s.user_id=u.id WHERE s.id=? AND u.id=? AND s.expires_at>? AND u.status='active'")
+            .bind(claims.sid).bind(claims.sub).bind(now()).fetch_optional(&s.db).await?
+    } else if !token.secret().contains('.') {
+        // Honor legacy sessions until their original expiration; issue no new ones.
+        sqlx::query_as::<_, Account>("SELECT u.id,u.name,u.email,u.phone,u.role,u.status FROM users u JOIN sessions s ON s.user_id=u.id WHERE s.token_hash=? AND s.expires_at>? AND u.status='active'")
+            .bind(hash(token.secret())).bind(now()).fetch_optional(&s.db).await?
+    } else { None }.ok_or(ApiError(StatusCode::UNAUTHORIZED,"Session expired or account unavailable".into()))?;
     s.admin_emails.check(&account.role, &account.email)?;
     Ok(User(account))
 }
+pub(crate) fn rider_session_key(s: &App, token: &SessionToken) -> String {
+    crate::sessions::check_jwt(s, token.secret(), true)
+        .map_or_else(|| hash(token.secret()), |claims| claims.sid)
+}
+
 fn email(s: &str) -> Result<String> {
     let s = text(s, 5, 190)?.to_lowercase();
     if !s.contains('@') || s.contains(char::is_whitespace) {
@@ -199,7 +216,11 @@ pub async fn register(
         status: status.into(),
     }))
 }
-pub async fn login(State(s): State<App>, Json(input): Json<Login>) -> Result<impl IntoResponse> {
+pub async fn login(
+    State(s): State<App>,
+    headers: HeaderMap,
+    Json(input): Json<Login>,
+) -> Result<impl IntoResponse> {
     let email = email(&input.email)?;
     text(&input.password, 1, PASSWORD_MAX_BYTES)?;
     let key = hash(&email);
@@ -243,6 +264,12 @@ pub async fn login(State(s): State<App>, Json(input): Json<Login>) -> Result<imp
             "Invalid email or password".into(),
         ));
     };
+    check_account_status(&status)?;
+    s.admin_emails.check(&role, &stored_email)?;
+    crate::sessions::issue(&s, &uid, &headers, &key).await
+}
+
+pub(crate) fn check_account_status(status: &str) -> Result<()> {
     if status == AccountStatus::PendingApproval.as_str() {
         return Err(ApiError(
             StatusCode::FORBIDDEN,
@@ -260,40 +287,9 @@ pub async fn login(State(s): State<App>, Json(input): Json<Login>) -> Result<imp
             .into(),
         ));
     }
-    s.admin_emails.check(&role, &stored_email)?;
-    let token = SessionToken::new(format!("{}{}", id(), id()));
-    sqlx::query("INSERT INTO sessions VALUES (?,?,?)")
-        .bind(hash(token.secret()))
-        .bind(uid)
-        .bind(now() + SESSION_SECONDS)
-        .execute(&s.db)
-        .await?;
-    sqlx::query("DELETE FROM login_attempts WHERE email_hash=?")
-        .bind(key)
-        .execute(&s.db)
-        .await?;
-    let cookie = format!(
-        "{SESSION_COOKIE}={}; Path=/; HttpOnly; SameSite=Lax; Max-Age={SESSION_SECONDS}{}",
-        token.secret(),
-        if s.secure_cookies { "; Secure" } else { "" }
-    );
-    Ok(([(SET_COOKIE, cookie)], Json(Acknowledged { ok: true })))
+    Ok(())
 }
-pub async fn logout(State(s): State<App>, headers: HeaderMap) -> Result<impl IntoResponse> {
-    if let Some(t) = session_token(&headers) {
-        sqlx::query("DELETE FROM sessions WHERE token_hash=?")
-            .bind(hash(t.secret()))
-            .execute(&s.db)
-            .await?;
-    }
-    Ok((
-        [(
-            SET_COOKIE,
-            "suki_session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0",
-        )],
-        Json(Acknowledged { ok: true }),
-    ))
-}
+
 pub async fn me(State(s): State<App>, user: User) -> Result<Json<SessionAccount>> {
     let approved_at = sqlx::query_scalar(
         "SELECT decided_at FROM onboarding_decisions WHERE user_id=? AND decision='active'",

@@ -28,6 +28,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 dotenvy = "0.15"
 futures-util = "0.3"
 ring = "=0.17.14"
+base64 = "=0.22.1"
+hex = "=0.4.3"
 aws-sdk-s3 = { version = "1.161.0", default-features = false, features = ["http-1x", "rustls", "default-https-client", "rt-tokio"] }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
 

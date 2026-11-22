@@ -118,7 +118,10 @@ fn PaymentProfile() -> Element {
                 let body = VendorPaymentProfile { gcash_number: (!raw.is_empty()).then_some(raw) };
                 busy.set(true);
                 spawn(async move {
-                    let result = api.send::<Acknowledged, _>(Method::PUT, "/vendor/payment-profile", &body).await;
+                    let result = async {
+                        api.confirm_sensitive_action().await?;
+                        api.send::<Acknowledged, _>(Method::PUT, "/vendor/payment-profile", &body).await
+                    }.await;
                     message.set(result.map_or_else(|e| e.to_string(), |_| "Payment profile saved.".into()));
                     busy.set(false);
                 });

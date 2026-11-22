@@ -72,7 +72,21 @@ The catalog starts empty. Register a vendor account, activate it in the admin da
 <!-- /coderabbit-ai-generated:v1 -->
 
 
+<!-- coderabbit-ai-generated:v1 -->
+
+<!-- coderabbit-ai-generated-section:v1:abab93b4f2a56aa17ce36d34673108f56cbffdfc2fa3065c4766a5fa81e31d7d -->
+
+## Remembered sessions and device unlock
+
+Generate and set a separate `SESSION_SIGNING_KEY` using `openssl rand -hex 32`. Share it with every API instance that serves this database and keep it in the server secret store. Apply migration 0009 before serving new login traffic. Existing opaque cookies remain valid until their original expiry; signing in again enrolls that browser or device into the new session system.
+
+Access tokens last 15 minutes. Device sessions expire 30 days after sign-in. Refresh tokens rotate on use; a duplicate submitted within five seconds is rejected without issuing credentials, and later reuse revokes the affected device session. Sign out clears the device’s saved credentials after the server revokes them. You can revoke other devices from **Account → Sign-in and devices**. Signing in again is required after expiry, revocation or loss of access to secure storage.
+
+Android and iOS remember the refresh credential in device-local secure storage. **Enable biometric login** asks the OS to protect access with biometrics or its device credential fallback. On Android 9–10, use your Suki password if fingerprint unlock is unavailable. After using a password to replace an inaccessible biometric vault, you can enable biometric login again. When enabled, the native app prompts on a fresh launch and before checkout or vendor payment profile changes. The browser uses HttpOnly cookies and does not display native biometric settings.
+
 ## Native mobile builds
+
+<!-- /coderabbit-ai-generated:v1 -->
 
 
 Run the following commands from the workspace root. Use Dioxus CLI 0.7.10 to match the application. Android requires JDK 17, SDK platform 35, build-tools 35.0.0 and NDK 27.2.12479018; set `ANDROID_HOME` and `NDK_HOME`. iOS requires macOS and Xcode. Device builds need your signing configuration.
