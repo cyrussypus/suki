@@ -20,12 +20,14 @@ use suki_shared::{
 };
 
 #[component]
-pub fn OrderList() -> Element {
+pub fn OrderList(messages_only: bool) -> Element {
     let api = use_context::<Api>();
     let mut state = use_context::<State>();
     let mut orders = use_signal(Vec::<Order>::new);
     let mut error = use_signal(String::new);
     let mut loading = use_signal(|| true);
+    let mut search = use_signal(String::new);
+    let mut filter = use_signal(|| "all");
     let signed_in = state.account.read().is_some();
     let rider = state
         .account
@@ -55,26 +57,73 @@ pub fn OrderList() -> Element {
             loading.set(false);
         }
     });
+    let term = search().trim().to_lowercase();
+    let visible = orders
+        .read()
+        .iter()
+        .filter(|order| {
+            let matches_search =
+                order.id.to_lowercase().contains(&term) || label(&order.status).contains(&term);
+            let matches_filter = match filter() {
+                "active" => !matches!(
+                    order.status.as_str(),
+                    "completed" | "delivered" | "canceled"
+                ),
+                "delivered" => matches!(order.status.as_str(), "delivered" | "completed"),
+                "canceled" => order.status == "canceled",
+                _ => true,
+            };
+            matches_search && matches_filter
+        })
+        .cloned()
+        .collect::<Vec<_>>();
     rsx! {
-        section { class: "panel",
-            div { class: "line", h1 { if rider { "Rider dashboard · Assigned deliveries" } else { "Orders" } }
-                if signed_in { button { disabled: loading(), onclick: move |_| refresh(), "Refresh" } }
+        section { class: "orders-page",
+            div { class: "page-title",
+                div { p { class: "eyebrow", if messages_only { "KEEP IN TOUCH" } else { "YOUR MARKET JOURNEY" } }
+                    h1 { if messages_only { "Messages" } else if rider { "Assigned deliveries" } else { "My orders" } }
+                }
+                if signed_in { button { class: "quiet refresh-link", disabled: loading(), onclick: move |_| refresh(), "Refresh ↻" } }
             }
+            if messages_only { p { class: "page-description", "Choose an order to open its conversation with the people helping you." } }
             if !signed_in {
-                p { "Sign in to see your orders." }
-                button { class: "primary", onclick: move |_| state.page.set(crate::Page::Account), "Sign in" }
+                div { class: "empty state-empty", span { class: "empty-icon", if messages_only { "✉" } else { "▤" } }
+                    h2 { "Let’s get you signed in" }
+                    p { if messages_only { "Your order conversations will appear here." } else { "Sign in to see your orders and follow their progress." } }
+                    button { class: "primary", onclick: move |_| state.page.set(crate::Page::Account), "Sign in" }
+                }
             } else if loading() {
-                p { "Loading orders…" }
+                p { class: "empty", "Loading orders…" }
             } else if !(error)().is_empty() {
-                p { role: "alert", "{error}" }
-            } else if orders.read().is_empty() {
-                p { "No orders yet." }
+                p { class: "notice", role: "alert", "{error}" }
             } else {
-                for order in orders.read().iter().cloned() {
-                    button { class: "order-link line", key: "{order.id}",
-                        onclick: move |_| state.active_order.set(Some(order.id.clone())),
-                        span { strong { "Order {short(&order.id)}" } small { "{label(&order.status)}" } }
-                        strong { "At checkout: {peso(order.estimated_total_centavos)}" }
+                if !messages_only {
+                    div { class: "search-row order-search", span { class: "search-icon", aria_hidden: "true", "⌕" }
+                        input { r#type: "search", aria_label: "Search orders", placeholder: "Search orders", value: "{search}", oninput: move |e| search.set(e.value()) }
+                    }
+                    div { class: "order-tabs", aria_label: "Filter orders",
+                        for (value, title) in [("all", "All"), ("active", "In progress"), ("delivered", "Delivered"), ("canceled", "Canceled")] {
+                            button { key: "{value}", aria_pressed: filter() == value, onclick: move |_| filter.set(value), "{title}" }
+                        }
+                    }
+                }
+                if visible.is_empty() {
+                    div { class: "empty state-empty", span { class: "empty-icon", if messages_only { "✉" } else { "▤" } }
+                        h2 { if messages_only { "No conversations yet" } else { "Nothing here yet" } }
+                        p { if messages_only { "When you place an order, you can chat with your market team here." } else { "Your orders will appear here as they make their way to you." } }
+                        if !rider && !messages_only { button { class: "primary", onclick: move |_| state.page.set(crate::Page::Market), "Explore the market" } }
+                    }
+                } else {
+                    div { class: "order-cards",
+                        for order in visible {
+                            button { class: "order-link", key: "{order.id}",
+                                onclick: move |_| state.active_order.set(Some(order.id.clone())),
+                                span { class: "order-mark", if messages_only { "✉" } else { "▤" } }
+                                span { class: "order-copy", strong { "Order {short(&order.id)}" } small { "{label(&order.status)}" } }
+                                if !messages_only { strong { class: "order-total", "{peso(order.estimated_total_centavos)}" } }
+                                span { aria_hidden: "true", "›" }
+                            }
+                        }
                     }
                 }
             }

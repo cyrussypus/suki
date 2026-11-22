@@ -1,4 +1,4 @@
-use crate::{Api, State};
+use crate::{Api, Page, State};
 use dioxus::prelude::*;
 use suki_shared::{
     catalog::{BasketLine, CatalogFilter, Product},
@@ -8,7 +8,7 @@ use suki_shared::{
 #[component]
 pub fn Market(favorites_only: bool) -> Element {
     let api = use_context::<Api>();
-    let state = use_context::<State>();
+    let mut state = use_context::<State>();
     let mut filter = use_signal(CatalogFilter::default);
     let mut drawer = use_signal(|| false);
     let mut refreshing = use_signal(|| false);
@@ -26,23 +26,48 @@ pub fn Market(favorites_only: bool) -> Element {
     rsx! {
         if !favorites_only {
             section { class: "hero", style: hero.map(|path| format!("--hero: url('{path}')")),
-                p { class: "eyebrow", "BANKEROHAN PUBLIC MARKET" }
-                h1 { "Fresh from Davao." }
-                p { "Shop your neighborhood market and get your fresh picks delivered." }
+                div { class: "hero-copy",
+                    p { class: "eyebrow", "YOUR NEIGHBORHOOD MARKET" }
+                    h1 { "A little closer to fresh." }
+                    p { "Good food, good people, straight from Davao’s market." }
+                    span { class: "hero-location", "✦  From Bankerohan, with care" }
+                }
             }
         }
         section { class: "market",
-            div { class: "line heading",
-                h2 { if favorites_only { "Your favorites" } else { "Shop the market" } }
-                button { class: "quiet", disabled: refreshing(), onclick: move |_| {
-                    let api = api.clone();
-                    refreshing.set(true);
-                    async move { crate::refresh_catalog(&api, state).await; refreshing.set(false); }
-                }, "Refresh" }
+            div { class: "market-intro",
+                div { p { class: "eyebrow", if favorites_only { "SAVED FOR LATER" } else { "FRESH FINDS, EVERY DAY" } }
+                    h2 { if favorites_only { "Your favorites" } else { "What’s on your list?" } }
+                }
+                if !favorites_only {
+                    button { class: "favorites-link", onclick: move |_| state.page.set(Page::Favorites), "♡  Favorites" }
+                } else {
+                    button { class: "quiet", onclick: move |_| state.page.set(Page::Market), "← Market" }
+                }
             }
-            div { class: "line filters",
-                input { r#type: "search", aria_label: "Search products", placeholder: "Search mangoes, fish, vendors…", value: "{chosen.search}", oninput: move |e| filter.write().search = e.value() }
-                button { aria_expanded: drawer(), onclick: move |_| drawer.toggle(), "Filters" }
+            div { class: "search-row",
+                span { class: "search-icon", aria_hidden: "true", "⌕" }
+                input { r#type: "search", aria_label: "Search products", placeholder: "Search produce, stalls and more", value: "{chosen.search}", oninput: move |e| filter.write().search = e.value() }
+                button { class: "filter-button", aria_expanded: drawer(), onclick: move |_| drawer.toggle(), "Filters" }
+            }
+            if !favorites_only {
+                div { class: "section-heading", h3 { "Explore the market" } span { "Browse by category" } }
+                div { class: "category-list", aria_label: "Product categories",
+                    button { class: if chosen.category.is_none() { "category active" } else { "category" }, onclick: move |_| filter.write().category = None,
+                        span { class: "category-icon", "✳" } span { "All finds" }
+                    }
+                    for category in state.categories.read().iter().cloned() {
+                        {
+                            let selected = chosen.category.as_deref() == Some(category.as_str());
+                            let icon = category_icon(&category);
+                            let category_value = category.clone();
+                            rsx! { button { key: "{category}", class: if selected { "category active" } else { "category" },
+                                onclick: move |_| filter.write().category = Some(category_value.clone()),
+                                span { class: "category-icon", "{icon}" } span { "{category}" }
+                            } }
+                        }
+                    }
+                }
             }
             if drawer() {
                 div { class: "panel filter-drawer",
@@ -62,13 +87,32 @@ pub fn Market(favorites_only: bool) -> Element {
                     }
                 }
             }
+            div { class: "section-heading picks-heading", h3 { if favorites_only { "Saved picks" } else { "Fresh from the stalls" } }
+                button { class: "quiet refresh-link", disabled: refreshing(), onclick: move |_| {
+                    let api = api.clone(); refreshing.set(true);
+                    async move { crate::refresh_catalog(&api, state).await; refreshing.set(false); }
+                }, "Refresh ↻" }
+            }
             if filtered.is_empty() {
-                p { class: "empty", if favorites_only { "No matching favorites. Save products with the heart button." } else { "No products match these filters." } }
+                div { class: "empty market-empty", span { class: "empty-icon", "✳" }
+                    h3 { if favorites_only { "Nothing saved yet" } else { "No finds just yet" } }
+                    p { if favorites_only { "Tap the heart on a product to save it here." } else { "Try another search or category, or check back for fresh picks." } }
+                }
             }
             div { class: "product-grid",
                 for product in filtered { ProductCard { key: "{product.id}", product } }
             }
         }
+    }
+}
+
+fn category_icon(category: &str) -> &'static str {
+    match category {
+        "Vegetables" => "🥬",
+        "Fruits" => "🍊",
+        "Meat & Poultry" => "🍗",
+        "Fish & Seafood" => "🐟",
+        _ => "🧺",
     }
 }
 
@@ -102,7 +146,7 @@ fn ProductCard(product: Product) -> Element {
                 small { "{product.vendor}" }
                 h3 { "{product.name}" }
                 if !product.local_name.is_empty() { p { class: "muted", "{product.local_name}" } }
-                p { "{product.description}" }
+
                 div { class: "line",
                     span { strong { "{peso(price)}" } " / {product.unit}" }
                     button { class: "primary", disabled: !product.available || state.pending.read().is_some(),

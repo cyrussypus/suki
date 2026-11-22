@@ -22,11 +22,24 @@ pub fn AccountScreen() -> Element {
     let mut error = use_signal(String::new);
     if let Some(account) = (state.account)() {
         return rsx! {
-            section { class: "panel", h1 { "Your account" }
-                p { "{account.name} · {account.role}" }
-                p { "{account.email}" }
+            section { class: "account-page",
+                p { class: "eyebrow", "GOOD TO SEE YOU" }
+                h1 { "Your account" }
+                div { class: "profile-card",
+                    span { class: "profile-avatar", "✳" }
+                    div { h2 { "{account.name}" } p { "{account.email}" } small { "{account.role}" } }
+                }
+                div { class: "account-menu",
+                    if account.has_role(Role::Customer) {
+                        button { onclick: move |_| { state.active_order.set(None); state.page.set(Page::Orders); }, span { class: "menu-icon", "▤" } span { strong { "My orders" } small { "Follow your market finds" } } b { "›" } }
+                        button { onclick: move |_| state.page.set(Page::Favorites), span { class: "menu-icon", "♡" } span { strong { "Saved favorites" } small { "Find the things you love" } } b { "›" } }
+                        button { onclick: move |_| state.page.set(Page::Basket), span { class: "menu-icon", "▱" } span { strong { "Your basket" } small { "Review your fresh picks" } } b { "›" } }
+                    } else {
+                        button { onclick: move |_| state.page.set(Page::Dashboard), span { class: "menu-icon", "▦" } span { strong { "Dashboard" } small { "View your workspace" } } b { "›" } }
+                    }
+                }
                 if !(error)().is_empty() { p { role: "alert", "{error}" } }
-                button { disabled: (state.signing_out)(), onclick: move |_| {
+                button { class: "signout", disabled: (state.signing_out)(), onclick: move |_| {
                     if (state.signing_out)() { return; }
                     let api = api.clone();
                     state.signing_out.set(true);
@@ -60,7 +73,7 @@ pub fn AccountScreen() -> Element {
         };
     }
     rsx! {
-        section { class: "panel", h1 { if register() { "Create a Suki account" } else { "Sign in to Suki" } }
+        section { class: "panel auth-panel", p { class: "eyebrow", "WELCOME TO SUKI" } h1 { if register() { "Create a Suki account" } else { "Sign in to Suki" } }
             form {
                 onsubmit: move |event| {
                     event.prevent_default();
