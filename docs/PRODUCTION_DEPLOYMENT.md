@@ -157,6 +157,10 @@ openssl rand -hex 32
 
 Place this file in the directory from which you run `suki-api` (e.g. `/etc/suki/`), with mode `600` and owned by the service user:
 
+<!-- coderabbit-ai-generated:v1 -->
+
+<!-- coderabbit-ai-generated-section:v1:3a898cee7b3dc6267c58181eb1339e97ee4f10f5637aebfdd0b057cdc281df27 -->
+
 ```bash
 sudo mkdir -p /etc/suki
 sudo chmod 700 /etc/suki
@@ -166,6 +170,8 @@ DATABASE_URL=mysql://suki:CHANGE_ME@127.0.0.1:3306/suki
 
 # Required cryptographic signing key — NEVER use the sample value
 SUKI_INTEGRITY_KEY=<your-openssl-rand-hex-32-output>
+DATA_ENCRYPTION_KEY=<a-different-openssl-rand-hex-32-output>
+SESSION_SIGNING_KEY=<another-different-openssl-rand-hex-32-output>
 
 # Server binding
 BIND_ADDR=127.0.0.1:8080
@@ -189,6 +195,8 @@ sudo chmod 600 /etc/suki/.env
 sudo chown suki:suki /etc/suki/.env   # assumes a 'suki' service user
 ```
 
+<!-- /coderabbit-ai-generated:v1 -->
+
 ### 4.3 Create the Service User
 
 ```bash
@@ -199,10 +207,16 @@ sudo chown -R suki:suki /var/lib/suki
 
 ### 4.4 All Environment Variables Reference
 
+<!-- coderabbit-ai-generated:v1 -->
+
+<!-- coderabbit-ai-generated-section:v1:6a392b42f7e206200ce23421e953966f3f20a337e41b0dabe1934ff7b3f2eb9f -->
+
 | Variable | Required | Default | Production value |
 |---|---|---|---|
 | `DATABASE_URL` | ✅ | — | `mysql://suki:…@127.0.0.1:3306/suki` |
 | `SUKI_INTEGRITY_KEY` | ✅ | — | 64-char hex from `openssl rand -hex 32` |
+| `DATA_ENCRYPTION_KEY` | ✅ | — | Separate 64-char hex key for MariaDB protected fields |
+| `SESSION_SIGNING_KEY` | ✅ | — | Separate 64-char hex key for access JWTs |
 | `BIND_ADDR` | No | `127.0.0.1:8080` | `127.0.0.1:8080` (proxied by Nginx) |
 | `APP_ORIGIN` | No | `http://localhost:8080` | `https://your-domain.example` (exact, no trailing slash) |
 | `COOKIE_SECURE` | No | `true` | `true` |
@@ -213,6 +227,8 @@ sudo chown -R suki:suki /var/lib/suki
 | `SUKI_ALLOW_LEGACY_QUOTES` | No | `false` (disabled) | Omit (keep disabled in production) |
 | `BOOTSTRAP_ADMIN_EMAIL` | First run only | — | Set once; **remove after first successful start** |
 | `BOOTSTRAP_ADMIN_PASSWORD` | First run only | — | Min 16 chars; **remove after first successful start** |
+
+<!-- /coderabbit-ai-generated:v1 -->
 
 ---
 

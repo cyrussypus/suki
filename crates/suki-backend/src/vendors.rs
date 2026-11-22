@@ -12,7 +12,7 @@ pub async fn items(State(s): State<App>, u: User) -> Result<Json<Vec<VendorItem>
         return Ok(Json(items));
     }
     let mut query = sqlx::QueryBuilder::<sqlx::MySql>::new(
-        "SELECT order_id,payload,snapshot_hash,signature FROM order_snapshots WHERE order_id IN (",
+        "SELECT order_id,payload_encrypted,snapshot_hash,signature FROM order_snapshots WHERE order_id IN (",
     );
     let mut ids = query.separated(",");
     for id in order_ids {
@@ -26,7 +26,7 @@ pub async fn items(State(s): State<App>, u: User) -> Result<Json<Vec<VendorItem>
     tx.commit().await?;
     let mut verified = std::collections::HashMap::new();
     for stored in receipts {
-        let snapshot = stored.verified(&s.integrity_key)?;
+        let snapshot = stored.verified(&s)?;
         verified.insert(snapshot.payload.order_id, snapshot.payload.items);
     }
     for item in &mut items {

@@ -2,8 +2,8 @@ use crate::auth::User;
 use crate::*;
 use axum::extract::{Path, State};
 pub use suki_shared::orders::{
-    AdjustmentProposal, Assignment, Checkout, CheckoutItem, Decision, Item, Order, Purchase,
-    Status, Substitution,
+    AdjustmentProposal, Assignment, Checkout, CheckoutItem, Decision, Item, Purchase, Status,
+    Substitution,
 };
 use suki_shared::{
     delivery::{grams_rounded_up, line_weight_milligrams},
@@ -11,6 +11,74 @@ use suki_shared::{
     payments::{PaymentMethod, VendorSettlement},
     snapshots::{SnapshotItem, SnapshotPayload, delivery_breakdown},
 };
+#[derive(sqlx::FromRow)]
+pub struct Order {
+    pub id: String,
+    pub customer_id: String,
+    pub courier_id: Option<String>,
+    pub status: String,
+    pub payment_status: String,
+    pub payment_method: String,
+    pub vendor_id: Option<String>,
+    pub gcash_number: Option<String>,
+    pub weight_grams: Option<i64>,
+    pub distance_meters: i64,
+    pub delivery_fee_centavos: i64,
+    pub goods_subtotal_centavos: i64,
+    pub final_goods_centavos: Option<i64>,
+    pub authorized_goods_centavos: i64,
+    pub created_at: i64,
+    pub updated_at: i64,
+    pub delivered_at: Option<i64>,
+    delivery_address_encrypted: Vec<u8>,
+    total_amount_centavos_encrypted: Vec<u8>,
+}
+
+impl Order {
+    pub fn is_cod(&self) -> bool {
+        self.payment_method == PaymentMethod::CashOnDelivery.as_str()
+    }
+
+    pub(crate) fn destination(
+        &self,
+        cipher: &protected::FieldCipher,
+    ) -> Result<protected::Destination> {
+        cipher.decode("orders.address", &self.id, &self.delivery_address_encrypted)
+    }
+
+    fn into_response(self, cipher: &protected::FieldCipher) -> Result<suki_shared::orders::Order> {
+        let destination = self.destination(cipher)?;
+        let total = cipher.decode(
+            "orders.total",
+            &self.id,
+            &self.total_amount_centavos_encrypted,
+        )?;
+        Ok(suki_shared::orders::Order {
+            id: self.id,
+            customer_id: self.customer_id,
+            courier_id: self.courier_id,
+            status: self.status,
+            payment_status: self.payment_status,
+            payment_method: self.payment_method,
+            vendor_id: self.vendor_id,
+            gcash_number: self.gcash_number,
+            weight_grams: self.weight_grams,
+            address: destination.address,
+            lat: destination.lat,
+            lng: destination.lng,
+            distance_meters: self.distance_meters,
+            delivery_fee_centavos: self.delivery_fee_centavos,
+            goods_subtotal_centavos: self.goods_subtotal_centavos,
+            estimated_total_centavos: total,
+            final_goods_centavos: self.final_goods_centavos,
+            authorized_goods_centavos: self.authorized_goods_centavos,
+            created_at: self.created_at,
+            updated_at: self.updated_at,
+            delivered_at: self.delivered_at,
+        })
+    }
+}
+
 pub async fn access(s: &App, u: &User, oid: &str) -> Result<Order> {
     let o: Order = sqlx::query_as("SELECT * FROM orders WHERE id=?")
         .bind(oid)
@@ -68,9 +136,15 @@ pub async fn history(
     audit(tx, &u.id, "order.status", oid, json!({"status":status})).await?;
     Ok(())
 }
-pub async fn list(State(s): State<App>, u: User) -> Result<Json<Vec<Order>>> {
+pub async fn list(State(s): State<App>, u: User) -> Result<Json<Vec<suki_shared::orders::Order>>> {
     u.require(&["customer", "courier", "admin"])?;
-    Ok(Json(sqlx::query_as("SELECT * FROM orders WHERE (?='admin') OR (customer_id=? AND ?='customer') OR (courier_id=? AND ?='courier') ORDER BY created_at DESC LIMIT 100").bind(&u.role).bind(&u.id).bind(&u.role).bind(&u.id).bind(&u.role).fetch_all(&s.db).await?))
+    let rows: Vec<Order> = sqlx::query_as("SELECT * FROM orders WHERE (?='admin') OR (customer_id=? AND ?='customer') OR (courier_id=? AND ?='courier') ORDER BY created_at DESC LIMIT 100")
+        .bind(&u.role).bind(&u.id).bind(&u.role).bind(&u.id).bind(&u.role)
+        .fetch_all(&s.db).await?;
+    rows.into_iter()
+        .map(|o| o.into_response(&s.field_cipher))
+        .collect::<Result<Vec<_>>>()
+        .map(Json)
 }
 pub async fn detail(
     State(s): State<App>,
@@ -112,12 +186,12 @@ pub async fn detail(
     .fetch_optional(&s.db)
     .await?;
     let mut tx = s.db.begin().await?;
-    let snapshot = snapshots::receipt(&mut tx, &s.integrity_key, &o.id, &o.customer_id)
+    let snapshot = snapshots::receipt(&mut tx, &s, &o.id, &o.customer_id)
         .await?
         .into_result()?;
     tx.commit().await?;
     Ok(Json(OrderDetail {
-        order: o,
+        order: o.into_response(&s.field_cipher)?,
         snapshot,
         items,
         payments,
@@ -132,9 +206,7 @@ pub async fn detail(
 struct Quote {
     id: String,
     customer_id: String,
-    address: String,
-    lat: f64,
-    lng: f64,
+    address_encrypted: Vec<u8>,
     distance_meters: i64,
     fee_centavos: i64,
     base_fee_centavos: i64,
@@ -180,7 +252,7 @@ pub async fn create(
                 "Idempotency key was used for different order details",
             ));
         }
-        let receipt = snapshots::receipt(&mut tx, &s.integrity_key, &oid, &u.id).await?;
+        let receipt = snapshots::receipt(&mut tx, &s, &oid, &u.id).await?;
         // The order already committed. Report its identity even if its receipt fails verification.
         let (snapshot, snapshot_invalid) = match receipt {
             snapshots::ReceiptState::Invalid => (None, true),
@@ -204,8 +276,11 @@ pub async fn create(
             "Delivery quote expired or unavailable; request a new quote",
         ));
     }
+    let destination: protected::Destination =
+        s.field_cipher
+            .decode("quotes.address", &q.id, &q.address_encrypted)?;
     let settings = crate::admin::load(&s.db).await?;
-    crate::delivery::coverage(&settings, q.lat, q.lng)?;
+    crate::delivery::coverage(&settings, destination.lat, destination.lng)?;
     if q.distance_meters > settings.max_distance_meters {
         return Err(ApiError::bad("Delivery exceeds current service coverage"));
     }
@@ -312,10 +387,10 @@ pub async fn create(
         "Delivery quote could not be verified; request a new quote",
     ))?;
     let total = subtotal + delivery.total_centavos;
-    sqlx::query("INSERT INTO orders(id,customer_id,status,payment_status,payment_method,vendor_id,gcash_number,weight_grams,address,lat,lng,distance_meters,delivery_fee_centavos,goods_subtotal_centavos,estimated_total_centavos,authorized_goods_centavos,idempotency_key,request_hash,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
+    sqlx::query("INSERT INTO orders(id,customer_id,status,payment_status,payment_method,vendor_id,gcash_number,weight_grams,delivery_address_encrypted,distance_meters,delivery_fee_centavos,goods_subtotal_centavos,total_amount_centavos_encrypted,authorized_goods_centavos,idempotency_key,request_hash,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
         .bind(&oid).bind(&u.id).bind(status).bind(payment_status).bind(v.payment_method.as_str())
-        .bind(&vendor_id).bind(gcash_number).bind(q.weight_grams).bind(&q.address).bind(q.lat).bind(q.lng)
-        .bind(q.distance_meters).bind(q.fee_centavos).bind(subtotal).bind(total)
+        .bind(&vendor_id).bind(gcash_number).bind(q.weight_grams).bind(s.field_cipher.encode("orders.address", &oid, &destination)?)
+        .bind(q.distance_meters).bind(q.fee_centavos).bind(subtotal).bind(s.field_cipher.encode("orders.total", &oid, &total)?)
         .bind(subtotal).bind(&v.idempotency_key).bind(digest).bind(created_at).bind(created_at).execute(&mut *tx).await?;
     for line in &lines {
         sqlx::query("INSERT INTO order_items(id,order_id,product_id,vendor_id,name,unit,unit_price_centavos,quantity_milli,estimated_cost_centavos) VALUES (?,?,?,?,?,?,?,?,?)")
@@ -324,12 +399,12 @@ pub async fn create(
     }
     let snapshot = snapshots::store(
         &mut tx,
-        &s.integrity_key,
+        &s,
         SnapshotPayload {
             order_id: oid.clone(),
             customer_id: u.id.clone(),
             vendor_id,
-            address: q.address,
+            address: destination.address,
             payment_method: v.payment_method,
             items: lines,
             delivery,

@@ -10,7 +10,7 @@ use axum::{
 use futures_util::{SinkExt, StreamExt};
 pub use suki_shared::realtime::{ChatMessage, Cursor, MessageInput, Position};
 use suki_shared::{
-    auth::{SESSION_COOKIE, SessionToken},
+    auth::SessionToken,
     crypto::{CHAT_AUTH, hash_message},
     realtime::{CourierLocation, LocationSnapshot, PositionResult},
 };
@@ -272,12 +272,7 @@ async fn events(socket: WebSocket, s: App, u: User, oid: String, token: SessionT
     let _ = output.close().await;
 }
 async fn session_valid(s: &App, u: &User, oid: &str, token: &SessionToken) -> bool {
-    let mut headers = HeaderMap::new();
-    let Ok(cookie) = format!("{SESSION_COOKIE}={}", token.secret()).parse() else {
-        return false;
-    };
-    headers.insert("cookie", cookie);
-    match crate::auth::authenticate(s, &headers).await {
+    match crate::auth::authenticate_token(s, token, true).await {
         Ok(current) if current.id == u.id => chat_access(s, &current, oid).await.is_ok(),
         _ => false,
     }
@@ -317,12 +312,7 @@ pub async fn tracking_websocket(
 }
 
 async fn tracking_valid(s: &App, u: &User, oid: &str, token: &SessionToken) -> bool {
-    let mut headers = HeaderMap::new();
-    let Ok(cookie) = format!("{SESSION_COOKIE}={}", token.secret()).parse() else {
-        return false;
-    };
-    headers.insert("cookie", cookie);
-    match crate::auth::authenticate(s, &headers).await {
+    match crate::auth::authenticate_token(s, token, true).await {
         Ok(current) if current.id == u.id && current.role == u.role => {
             tracking_access(s, &current, oid).await.is_ok()
         }
@@ -340,7 +330,7 @@ async fn tracking(socket: WebSocket, s: App, u: User, oid: String, token: Sessio
                 Some(Ok(Message::Text(text))) => {
                     if !tracking_valid(&s, &u, &oid, &token).await || u.role == "customer" { break; }
                     let Ok(position) = serde_json::from_str::<Position>(&text) else { break; };
-                    if position.observed_at.is_none() || s.rate_limits.rider(token.secret()).is_err() { break; }
+                    if position.observed_at.is_none() || s.rate_limits.rider(&crate::auth::rider_session_key(&s, &token)).is_err() { break; }
                     if let Err(error) = store_location(&s, &u, &oid, position).await {
                         let body = json!({"error": error.1}).to_string();
                         if output.send(Message::Text(body.into())).await.is_err() || matches!(error.0, StatusCode::FORBIDDEN | StatusCode::CONFLICT | StatusCode::UNAUTHORIZED) { break; }
@@ -388,9 +378,10 @@ pub async fn eta(
         return Err(ApiError::conflict("Rider location is stale"));
     }
     s.rate_limits.eta(&u.id)?;
+    let destination = order.destination(&s.field_cipher)?;
     let response = s.client.post(&s.maps_url).header("X-Goog-Api-Key", &s.maps_key)
         .header("X-Goog-FieldMask", "routes.distanceMeters,routes.duration")
-        .json(&json!({"origin":{"location":{"latLng":{"latitude":lat,"longitude":lng}}},"destination":{"location":{"latLng":{"latitude":order.lat,"longitude":order.lng}}},"travelMode":"DRIVE","routingPreference":"TRAFFIC_UNAWARE","computeAlternativeRoutes":false}))
+        .json(&json!({"origin":{"location":{"latLng":{"latitude":lat,"longitude":lng}}},"destination":{"location":{"latLng":{"latitude":destination.lat,"longitude":destination.lng}}},"travelMode":"DRIVE","routingPreference":"TRAFFIC_UNAWARE","computeAlternativeRoutes":false}))
         .send().await.map_err(|_| ApiError(StatusCode::BAD_GATEWAY, "Route service unavailable".into()))?;
     if !response.status().is_success() {
         return Err(ApiError(

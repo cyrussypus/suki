@@ -40,13 +40,11 @@ async fn call(
     let status = response.status();
     let cookie = response
         .headers()
-        .get("set-cookie")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .split(';')
-        .next()
-        .unwrap_or("")
-        .to_string();
+        .get_all("set-cookie")
+        .iter()
+        .filter_map(|v| v.to_str().ok()?.split(';').next())
+        .collect::<Vec<_>>()
+        .join("; ");
     let bytes = response.into_body().collect().await.unwrap().to_bytes();
     let value = serde_json::from_slice(&bytes)
         .unwrap_or_else(|_| json!({"raw":String::from_utf8_lossy(&bytes)}));
@@ -75,13 +73,13 @@ async fn login(app: &axum::Router, email: &str) -> String {
     assert!(!c.is_empty());
     c
 }
-async fn activate(app: &axum::Router, admin: &str, uid: &str, role: &str) {
+async fn approve(app: &axum::Router, admin: &str, uid: &str) {
     ok(
         app,
-        "PATCH",
-        &format!("/api/admin/users/{uid}"),
+        "POST",
+        &format!("/api/admin/users/{uid}/approve"),
         admin,
-        json!({"role":role,"status":"active"}),
+        Value::Null,
     )
     .await;
 }
@@ -99,6 +97,231 @@ async fn quote(app: &axum::Router, cookie: &str) -> Value {
     .await
 }
 
+async fn device_sessions(
+    app: &axum::Router,
+    state: &AppState,
+    owner: &str,
+    email: &str,
+    stranger: &str,
+) {
+    use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+    let pos = owner
+        .split(';')
+        .find_map(|v| v.trim().strip_prefix("suki_session="))
+        .unwrap();
+    let payload = URL_SAFE_NO_PAD
+        .decode(pos.split('.').nth(1).unwrap())
+        .unwrap();
+    let claims: Value = serde_json::from_slice(&payload).unwrap();
+    assert_eq!(
+        claims["exp"].as_i64().unwrap() - claims["iat"].as_i64().unwrap(),
+        900
+    );
+
+    let refresh_only = |cookie: &str| {
+        cookie
+            .split(';')
+            .find(|v| v.trim().starts_with("suki_refresh="))
+            .unwrap()
+            .trim()
+            .to_owned()
+    };
+    let tablet = login(app, email).await;
+    let old = refresh_only(&tablet);
+    let listing = ok(app, "GET", "/api/auth/sessions", owner, Value::Null).await;
+    assert_eq!(listing.as_array().unwrap().len(), 2);
+    let other = listing
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["current"] == false)
+        .unwrap();
+    assert_eq!(
+        other["expires_at"].as_i64().unwrap() - other["created_at"].as_i64().unwrap(),
+        30 * 86_400
+    );
+    let id = other["id"].as_str().unwrap();
+    let path = format!("/api/auth/sessions/{id}");
+    assert_eq!(
+        call(app, "DELETE", &path, stranger, Value::Null).await.0,
+        404
+    );
+    let (status, _, rotated) = call(app, "POST", "/api/auth/refresh", &old, Value::Null).await;
+    assert_eq!(status, 200);
+    assert_ne!(refresh_only(&rotated), old);
+    assert_ne!(rotated.split(';').next(), tablet.split(';').next());
+    assert_eq!(
+        call(app, "POST", "/api/auth/refresh", &old, Value::Null)
+            .await
+            .0,
+        409
+    );
+    let raw = refresh_only(&rotated);
+    let stored: String =
+        sqlx::query_scalar("SELECT refresh_token_hash FROM user_sessions WHERE id=?")
+            .bind(id)
+            .fetch_one(&state.db)
+            .await
+            .unwrap();
+    assert_eq!(
+        stored,
+        suki_api::hash(raw.trim_start_matches("suki_refresh="))
+    );
+    sqlx::query("UPDATE spent_refresh_tokens SET used_at=? WHERE session_id=?")
+        .bind(now() - 10)
+        .bind(id)
+        .execute(&state.db)
+        .await
+        .unwrap();
+    assert_eq!(
+        call(app, "POST", "/api/auth/refresh", &old, Value::Null)
+            .await
+            .0,
+        401
+    );
+    assert_eq!(
+        call(app, "GET", "/api/auth/me", &rotated, Value::Null)
+            .await
+            .0,
+        401
+    );
+    assert_eq!(
+        call(app, "POST", "/api/auth/refresh", &raw, Value::Null)
+            .await
+            .0,
+        401
+    );
+    assert_eq!(
+        call(app, "GET", "/api/auth/me", owner, Value::Null).await.0,
+        200
+    );
+
+    let tablet = login(app, email).await;
+    let listing = ok(app, "GET", "/api/auth/sessions", owner, Value::Null).await;
+    let id = listing
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["current"] == false)
+        .unwrap()["id"]
+        .as_str()
+        .unwrap();
+    ok(
+        app,
+        "DELETE",
+        &format!("/api/auth/sessions/{id}"),
+        owner,
+        Value::Null,
+    )
+    .await;
+    assert_eq!(
+        call(app, "GET", "/api/auth/me", &tablet, Value::Null)
+            .await
+            .0,
+        401
+    );
+    assert_eq!(
+        call(
+            app,
+            "POST",
+            "/api/auth/refresh",
+            &refresh_only(&tablet),
+            Value::Null
+        )
+        .await
+        .0,
+        401
+    );
+
+    let tablet = login(app, email).await;
+    ok(
+        app,
+        "POST",
+        "/api/auth/logout",
+        &refresh_only(&tablet),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(
+        call(app, "GET", "/api/auth/me", &tablet, Value::Null)
+            .await
+            .0,
+        401
+    );
+}
+
+const LEGACY_ADDRESS: &str = "123 Synthetic Legacy Address, Davao City";
+
+async fn seed_legacy(
+    db: &sqlx::MySqlPool,
+    key: &suki_shared::crypto::IntegrityKey,
+) -> (String, String) {
+    use suki_shared::{
+        crypto::{SNAPSHOT_AUTH, TRANSACTION_AUTH, hash_snapshot, hash_transaction},
+        payments::PaymentMethod,
+        snapshots::{SnapshotPayload, delivery_breakdown},
+    };
+    let customer = id();
+    let order = id();
+    let created = now();
+    sqlx::query("INSERT INTO users (id,name,email,phone,password_hash,role,status,created_at) VALUES (?,'Legacy Test Customer',?,'','unused','customer','active',?)")
+        .bind(&customer).bind(format!("{customer}@test.invalid")).bind(created).execute(db).await.unwrap();
+    let quote = id();
+    sqlx::query("INSERT INTO delivery_quotes(id,customer_id,address,lat,lng,distance_meters,fee_centavos,base_fee_centavos,per_km_centavos,expires_at) VALUES (?,?,?,7.05,125.59,1000,6350,6000,350,?)")
+        .bind(&quote).bind(&customer).bind(LEGACY_ADDRESS).bind(created + 300).execute(db).await.unwrap();
+    sqlx::query("INSERT INTO customer_addresses(id,customer_id,label,address,lat,lng) VALUES (?,?,'Home',?,7.05,125.59)")
+        .bind(id()).bind(&customer).bind(LEGACY_ADDRESS).execute(db).await.unwrap();
+    sqlx::query("INSERT INTO orders(id,customer_id,status,address,lat,lng,distance_meters,delivery_fee_centavos,goods_subtotal_centavos,estimated_total_centavos,authorized_goods_centavos,idempotency_key,request_hash,created_at,updated_at) VALUES (?,?,'awaiting_payment',?,7.05,125.59,1000,6350,50000,56350,50000,'legacy-test',?, ?, ?)")
+        .bind(&order).bind(&customer).bind(LEGACY_ADDRESS).bind("0".repeat(64)).bind(created).bind(created).execute(db).await.unwrap();
+    let payload = serde_json::to_vec(&SnapshotPayload {
+        order_id: order.clone(),
+        customer_id: customer.clone(),
+        vendor_id: None,
+        address: LEGACY_ADDRESS.into(),
+        payment_method: PaymentMethod::Gcash,
+        items: vec![],
+        delivery: delivery_breakdown(quote, 1000, None, 6000, 350).unwrap(),
+        goods_subtotal_centavos: 50000,
+        total_centavos: 56350,
+        created_at: created,
+    })
+    .unwrap();
+    let hash = hash_snapshot(&payload);
+    sqlx::query(
+        "INSERT INTO order_snapshots (order_id,payload,snapshot_hash,signature) VALUES (?,?,?,?)",
+    )
+    .bind(&order)
+    .bind(payload)
+    .bind(&hash)
+    .bind(key.sign(SNAPSHOT_AUTH, &hash))
+    .execute(db)
+    .await
+    .unwrap();
+    let mut previous = "genesis".to_owned();
+    let entries: Vec<(i64, String, String, i64)> = sqlx::query_as(
+        "SELECT id,event,payload,created_at FROM order_integrity WHERE order_id=? ORDER BY id",
+    )
+    .bind(&order)
+    .fetch_all(db)
+    .await
+    .unwrap();
+    for (id, event, payload, created) in entries {
+        let tag = key.sign(
+            TRANSACTION_AUTH,
+            &hash_transaction(&order, id, &event, &customer, created, &payload, &previous),
+        );
+        sqlx::query("UPDATE order_integrity SET actor_id=?,tag=? WHERE id=?")
+            .bind(&customer)
+            .bind(&tag)
+            .bind(id)
+            .execute(db)
+            .await
+            .unwrap();
+        previous = tag;
+    }
+    (order, hash)
+}
+
 #[tokio::test]
 #[ignore = "requires TEST_DATABASE_URL pointing at a dedicated MariaDB database"]
 async fn full_order_and_authorization() {
@@ -109,7 +332,28 @@ async fn full_order_and_authorization() {
         .await
         .unwrap();
     assert!(name.ends_with("_test"), "Test database must end in _test");
-    sqlx::migrate!("./migrations").run(&db).await.unwrap();
+    let migrator = sqlx::migrate!("./migrations");
+    let signing = suki_shared::crypto::IntegrityKey::from_hex(&"12".repeat(32)).unwrap();
+    let upgraded: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM information_schema.TABLES WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='data_encryption_check')",
+    ).fetch_one(&db).await.unwrap();
+    let old = if upgraded {
+        None
+    } else {
+        migrator.run_to(7, &db).await.unwrap();
+        Some(seed_legacy(&db, &signing).await)
+    };
+    migrator.run(&db).await.unwrap();
+    let field_cipher =
+        Arc::new(suki_api::protected::FieldCipher::from_hex(&"ab".repeat(32)).unwrap());
+    suki_api::protected::backfill(&db, &field_cipher)
+        .await
+        .unwrap();
+    suki_api::protected::backfill(&db, &field_cipher)
+        .await
+        .unwrap();
+    let wrong = suki_api::protected::FieldCipher::from_hex(&"bc".repeat(32)).unwrap();
+    assert!(suki_api::protected::backfill(&db, &wrong).await.is_err());
     let fixture = axum::Router::new().route(
         "/route",
         axum::routing::post(|Json(v): Json<Value>| async move {
@@ -190,7 +434,9 @@ async fn full_order_and_authorization() {
             admin_email.to_uppercase()
         ))
         .unwrap(),
-        integrity_key: suki_shared::crypto::IntegrityKey::from_hex(&"12".repeat(32)).unwrap(),
+        integrity_key: signing,
+        field_cipher: field_cipher.clone(),
+        session_key: Arc::new(suki_api::sessions::SessionKey::from_hex(&"21".repeat(32)).unwrap()),
         client: reqwest::Client::new(),
         secure_cookies: false,
         origin: "http://localhost:3000".into(),
@@ -216,6 +462,39 @@ async fn full_order_and_authorization() {
         .await
         .unwrap();
     let admin = login(&app, &admin_email).await;
+    if let Some((order, hash)) = old {
+        let detail = ok(
+            &app,
+            "GET",
+            &format!("/api/orders/{order}"),
+            &admin,
+            Value::Null,
+        )
+        .await;
+        assert_eq!(detail["order"]["address"], LEGACY_ADDRESS);
+        assert_eq!(detail["order"]["estimated_total_centavos"], 56350);
+        assert_eq!(detail["snapshot"]["snapshot_hash"], hash);
+        let inspection = suki_api::router(Arc::new(AppState {
+            rate_limits: Default::default(),
+            ..(*s).clone()
+        }));
+        let report = ok(
+            &inspection,
+            "GET",
+            &format!("/api/admin/orders/{order}/integrity"),
+            &admin,
+            Value::Null,
+        )
+        .await;
+        assert_eq!(report["snapshot"], "verified");
+        assert_eq!(report["transactions_verified"], 2);
+        let protected: (bool,bool) = sqlx::query_as("SELECT address IS NULL AND lat IS NULL AND lng IS NULL AND estimated_total_centavos IS NULL, total_amount_centavos_encrypted IS NOT NULL FROM orders WHERE id=?")
+            .bind(&order).fetch_one(&db).await.unwrap();
+        assert_eq!(protected, (true, true));
+        let plaintext: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM order_integrity WHERE order_id=? AND JSON_CONTAINS_PATH(payload,'one','$.estimated_total_centavos')")
+            .bind(&order).fetch_one(&db).await.unwrap();
+        assert_eq!(plaintext, 0);
+    }
     let unknown_email = format!("{}@test.invalid", id());
     for email in [&admin_email, &unknown_email, &unknown_email] {
         assert_eq!(
@@ -236,8 +515,12 @@ async fn full_order_and_authorization() {
     let customer = login(&app, &customer_email).await;
     let (_, other_email) = account(&app, "customer").await;
     let other = login(&app, &other_email).await;
+    device_sessions(&app, &s, &customer, &customer_email, &other).await;
     let saved_address=ok(&app,"POST","/api/addresses",&customer,json!({"label":"Home","address":"123 Synthetic Address, Davao City","lat":7.05,"lng":125.59})).await;
     assert!(saved_address["id"].is_string());
+    let protected: bool = sqlx::query_scalar("SELECT address IS NULL AND label IS NULL AND lat IS NULL AND lng IS NULL AND address_encrypted IS NOT NULL FROM customer_addresses WHERE id=?")
+        .bind(saved_address["id"].as_str().unwrap()).fetch_one(&db).await.unwrap();
+    assert!(protected);
     assert_eq!(
         ok(&app, "GET", "/api/addresses", &customer, Value::Null)
             .await
@@ -287,8 +570,94 @@ async fn full_order_and_authorization() {
         .0,
         403
     );
-    activate(&app, &admin, &vendor_id, "vendor").await;
+    let approve_path = format!("/api/admin/users/{vendor_id}/approve");
+    assert_eq!(
+        call(&app, "POST", &approve_path, &customer, Value::Null)
+            .await
+            .0,
+        403
+    );
+    assert_eq!(
+        call(
+            &app,
+            "PATCH",
+            &format!("/api/admin/users/{vendor_id}"),
+            &admin,
+            json!({"role":"vendor","status":"active"})
+        )
+        .await
+        .0,
+        409
+    );
+    approve(&app, &admin, &vendor_id).await;
     let vendor = login(&app, &vendor_email).await;
+    assert!(ok(&app, "GET", "/api/auth/me", &vendor, Value::Null).await["approved_at"].is_i64());
+    let (rejected_id, rejected_email) = account(&app, "rider").await;
+    let (pending, msg, cookie) = call(
+        &app,
+        "POST",
+        "/api/auth/login",
+        "",
+        json!({"email":rejected_email,"password":"Synthetic-test-password-42"}),
+    )
+    .await;
+    assert_eq!(pending, 403);
+    assert_eq!(msg["error"], "Account pending admin approval.");
+    assert!(cookie.is_empty());
+    let onboarding = suki_api::router(Arc::new(AppState {
+        rate_limits: Default::default(),
+        ..(*s).clone()
+    }));
+    ok(
+        &onboarding,
+        "POST",
+        &format!("/api/admin/users/{rejected_id}/reject"),
+        &admin,
+        Value::Null,
+    )
+    .await;
+    assert_eq!(
+        call(
+            &onboarding,
+            "POST",
+            &format!("/api/admin/users/{rejected_id}/approve"),
+            &admin,
+            Value::Null
+        )
+        .await
+        .0,
+        409
+    );
+    let (status, msg, _) = call(
+        &app,
+        "POST",
+        "/api/auth/login",
+        "",
+        json!({"email":rejected_email,"password":"Synthetic-test-password-42"}),
+    )
+    .await;
+    assert_eq!(status, 403);
+    assert_eq!(msg["error"], "Account application was rejected.");
+    for _ in 0..8 {
+        assert_eq!(
+            call(&onboarding, "GET", "/api/admin/users", &admin, Value::Null)
+                .await
+                .0,
+            200
+        );
+    }
+    assert_eq!(
+        call(
+            &onboarding,
+            "POST",
+            &format!("/api/admin/users/{rejected_id}/reject"),
+            &admin,
+            Value::Null
+        )
+        .await
+        .0,
+        429
+    );
     assert_eq!(
         call(&app, "POST", "/api/products", &customer, product(16000))
             .await
@@ -299,7 +668,7 @@ async fn full_order_and_authorization() {
         .as_u64()
         .unwrap();
     let (vendor2_id, vendor2_email) = account(&app, "vendor").await;
-    activate(&app, &admin, &vendor2_id, "vendor").await;
+    approve(&app, &admin, &vendor2_id).await;
     let vendor2 = login(&app, &vendor2_email).await;
     assert_eq!(
         call(
@@ -372,8 +741,8 @@ async fn full_order_and_authorization() {
     )
     .await;
 
-    let (courier_id, courier_email) = account(&app, "customer").await;
-    activate(&app, &admin, &courier_id, "courier").await;
+    let (courier_id, courier_email) = account(&app, "rider").await;
+    approve(&app, &admin, &courier_id).await;
     let courier = login(&app, &courier_email).await;
     let blocked_admin = suki_api::router(Arc::new(AppState {
         admin_emails: suki_api::auth::AdminEmails::parse(&format!(
@@ -677,6 +1046,8 @@ async fn full_order_and_authorization() {
         db: db.clone(),
         rate_limits: Default::default(),
         integrity_key: s.integrity_key.clone(),
+        field_cipher: field_cipher.clone(),
+        session_key: s.session_key.clone(),
         client: reqwest::Client::new(),
         secure_cookies: false,
         origin: "http://localhost:3000".into(),
@@ -1258,8 +1629,12 @@ async fn full_order_and_authorization() {
     .await;
     let canceled = ok(&app, "GET", &path2, &customer, Value::Null).await;
     assert_eq!(canceled["refunds"][0][1], 69432);
+    let marketplace = suki_api::router(Arc::new(AppState {
+        rate_limits: Default::default(),
+        ..(*s).clone()
+    }));
     marketplace_workflow(
-        &app,
+        &marketplace,
         s.as_ref(),
         live_address,
         [&customer, &vendor, &courier, &admin, &vendor2],
@@ -1267,7 +1642,14 @@ async fn full_order_and_authorization() {
     )
     .await;
 
-    activate(&app, &admin, &vendor2_id, "vendor").await;
+    ok(
+        &app,
+        "PATCH",
+        &format!("/api/admin/users/{vendor2_id}"),
+        &admin,
+        json!({"role":"vendor","status":"active"}),
+    )
+    .await;
     assert_eq!(
         call(&app, "GET", "/api/auth/me", &vendor2, Value::Null)
             .await

@@ -140,7 +140,7 @@ pub fn Basket() -> Element {
                                 label { "Saved addresses"
                                     select { onchange: move |event| {
                                         if let Some(saved) = addresses.read().iter().find(|saved| saved.id == event.value()) {
-                                            address.set(saved.address.clone());
+                                            address.set(suki_shared::addresses::display_address_text(&saved.address));
                                             latitude.set(saved.lat.to_string());
                                             longitude.set(saved.lng.to_string());
                                             quote.set(None);
@@ -148,7 +148,7 @@ pub fn Basket() -> Element {
                                     },
                                         option { value: "", "Choose an address" }
                                         for saved in addresses.read().iter() {
-                                            option { key: "{saved.id}", value: "{saved.id}", "{saved.label}" }
+                                            option { key: "{saved.id}", value: "{saved.id}", "{suki_shared::addresses::display_address_text(&saved.label)}" }
                                         }
                                     }
                                 }
@@ -199,11 +199,16 @@ pub fn Basket() -> Element {
                                 }).collect(),
                             }
                         };
-                        state.pending.set(Some(request.clone()));
                         busy.set(true);
                         error.set(String::new());
                         let api = api.clone();
                         spawn(async move {
+                            if let Err(reason) = api.confirm_sensitive_action().await {
+                                error.set(reason.to_string());
+                                busy.set(false);
+                                return;
+                            }
+                            state.pending.set(Some(request.clone()));
                             match api.send::<CheckoutResult, _>(Method::POST, "/orders/checkout", &request).await {
                                 Ok(result) => {
                                     state.pending.set(None);

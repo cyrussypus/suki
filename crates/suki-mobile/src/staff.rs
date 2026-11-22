@@ -15,22 +15,37 @@ use suki_shared::{
 #[component]
 pub fn AdminDashboard() -> Element {
     let api = use_context::<Api>();
+    let accounts_api = api.clone();
+    let mut accounts = use_resource(move || {
+        let api = accounts_api.clone();
+        async move { api.get::<Vec<Account>>("/admin/users").await }
+    });
     let mut dashboard = use_resource(move || {
         let api = api.clone();
         async move {
-            let (pending, accounts, reports, audit) = futures_util::join!(
+            let (pending, reports, audit) = futures_util::join!(
                 api.get::<Vec<Payment>>("/admin/payments/pending"),
-                api.get::<Vec<Account>>("/admin/users"),
                 api.get::<Reports>("/admin/reports"),
                 api.get::<Vec<AuditEntry>>("/admin/audit"),
             );
-            Ok::<_, crate::api::Failure>((pending?, accounts?, reports?, audit?))
+            Ok::<_, crate::api::Failure>((pending?, reports?, audit?))
         }
     });
     rsx! {
-        div { class: "line", h1 { "Admin dashboard" } button { onclick: move |_| dashboard.restart(), "Refresh dashboard" } }
+        div { class: "line", h1 { "Admin dashboard" } button { onclick: move |_| { accounts.restart(); dashboard.restart(); }, "Refresh dashboard" } }
+        details { class: "panel", summary { "Account approvals and role management" }
+            match &*accounts.read() {
+                Some(Ok(rows)) => rsx! {
+                    for account in rows {
+                        ManageUser { key: "{account.id}-{account.role}-{account.status}", account: account.clone(), onsaved: move |_| accounts.restart() }
+                    }
+                },
+                Some(Err(error)) => rsx! { p { role: "alert", "{error}" } },
+                None => rsx! { p { "Loading accounts…" } },
+            }
+        }
         match &*dashboard.read() {
-            Some(Ok((pending, accounts, reports, audit))) => rsx! {
+            Some(Ok((pending, reports, audit))) => rsx! {
                 section { class: "panel", h2 { "GCash reference audit" }
                     if pending.is_empty() { p { "No pending references." } }
                     for payment in pending { VerifyPayment { key: "{payment.id}", payment: payment.clone(), onsaved: move |_| dashboard.restart() } }
@@ -42,11 +57,6 @@ pub fn AdminDashboard() -> Element {
                     }
                 }
                 IntegrityInspector { recent_ids: reports.orders.iter().take(30).map(|order| order.order_id.clone()).collect::<Vec<_>>() }
-                details { class: "panel", summary { "Role management" }
-                    for account in accounts {
-                        ManageUser { key: "{account.id}", account: account.clone(), onsaved: move |_| dashboard.restart() }
-                    }
-                }
                 details { class: "panel", summary { "Recent audit activity" }
                     for event in audit.iter().take(30) {
                         p { key: "{event.id}", "{event.action} · {event.entity_id}" }
@@ -139,6 +149,26 @@ fn ManageUser(account: Account, onsaved: EventHandler<()>) -> Element {
     let mut busy = use_signal(|| false);
     let mut message = use_signal(String::new);
     let self_user = state.account.read().as_ref().is_some_and(|u| u.id == id);
+    let pending = account.status == suki_shared::auth::AccountStatus::PendingApproval.as_str();
+    let rejected = account.status == suki_shared::auth::AccountStatus::Rejected.as_str();
+    let decision_api = api.clone();
+    let decision_id = id.clone();
+    let mut decide = move |action: &'static str| {
+        if busy() {
+            return;
+        }
+        busy.set(true);
+        let api = decision_api.clone();
+        let path = format!("/admin/users/{decision_id}/{action}");
+        spawn(async move {
+            match api.send::<Acknowledged, _>(Method::POST, &path, &()).await {
+                Ok(_) => onsaved.call(()),
+                Err(e) => message.set(e.to_string()),
+            };
+            busy.set(false);
+        });
+    };
+    let mut reject = decide.clone();
     rsx! {
         form { class: "order-link", onsubmit: move |e| {
             e.prevent_default();
@@ -156,7 +186,14 @@ fn ManageUser(account: Account, onsaved: EventHandler<()>) -> Element {
             });
         },
             strong { "{account.name} · {account.email}" }
-            if !self_user {
+            if pending {
+                p { "Pending approval · {account.role}" }
+                button { r#type: "button", disabled: busy(), onclick: move |_| decide("approve"), "Approve application" }
+                button { r#type: "button", disabled: busy(), onclick: move |_| reject("reject"), "Reject application" }
+                p { role: "status", "{message}" }
+            } else if rejected {
+                p { "Application rejected" }
+            } else if !self_user {
                 label { "Role" select { value: "{role}", onchange: move |e| role.set(e.value()),
                     option { value: "customer", "Customer" }
                     option { value: "vendor", "Vendor" }
